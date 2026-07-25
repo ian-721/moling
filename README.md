@@ -1,21 +1,39 @@
 # 墨灵（Moling / Living Notebook）
 
-墨灵是一款面向 Android 平板的 AI 手写笔记本原型。
+墨灵是一款 Android 平板优先的 AI 手写笔记本。
 
-用户在纸面界面上手写，客户端优先通过 ML Kit Digital Ink Recognition 在本地识别文字，后端调用大模型生成回应，再由客户端以墨迹动画写回纸面。它不是聊天软件，核心体验是“笔记本像有灵魂一样回应”。
+用户在纸面界面上手写，客户端优先在本地识别文字，服务端生成回应，再由客户端以墨迹动画写回纸面。它不是聊天软件，核心体验是：
 
-> 当前状态：可运行的早期原型，供内部开发和真机测试使用，尚未按生产环境标准完成配置、测试与部署。
+> 写下，它会像一本熟悉你、有判断的笔记本一样回应。
+
+## 当前状态
+
+当前仓库已有可运行的早期原型，核心链路已经形成，但生产化改造尚未完成。
+
+截至 2026-07-25，项目已经正式冻结以下方向：
+
+- 从内部原型进入正式上线工程；
+- 生产默认模型迁移到 DeepSeek V4；
+- 建设“老g”人格与每个用户隔离的私有记忆；
+- 完成本地持久化、账号与多端同步；
+- 推进 Google Play 和华为 AppGallery 实际上架；
+- 建设免费额度、订阅和统一权益架构。
+
+**重要：当前代码仍包含旧 OpenAI Responses API 原型实现和局域网开发配置。上述迁移尚未宣称完成，等待 M0-A 工程任务实际修改、测试和部署。**
 
 ## 核心链路
 
 ```text
-用户手写 strokes
+用户 strokes
+→ 本地保存
 → ML Kit 本地文字识别
-→ FastAPI 后端生成回复
+→ 服务端加载人格、记忆和最近上下文
+→ DeepSeek 生成结构化回应
 → InkReplyOverlay 墨迹浮现
+→ 本地保存并后台同步
 ```
 
-OpenAI Vision OCR 仅保留为开发阶段的 fallback/debug 路径，不应作为默认识别方式。
+OpenAI Vision OCR 只保留为开发阶段的 fallback/debug 路径，不应作为默认识别方式或华为兼容问题的长期解决方案。
 
 ## 仓库结构
 
@@ -23,30 +41,59 @@ OpenAI Vision OCR 仅保留为开发阶段的 fallback/debug 路径，不应作�
 moling/
 ├─ moling-android/       # Kotlin + Jetpack Compose Android 客户端
 ├─ backend/              # Python FastAPI 后端
-├─ docs/                 # 早期开发资料
-├─ AGENTS.md             # 项目约束与开发规则
+├─ docs/
+│  ├─ launch/            # 正式上线、人格、DeepSeek、商店与收费规划
+│  └─ ...                # 早期开发资料
+├─ AGENTS.md             # 当前最高优先级项目规则
 └─ README.md
 ```
 
+## 正式规划
+
+开发前必须阅读：
+
+1. [`docs/launch/01_MOLING_LAUNCH_MASTER_PLAN.md`](docs/launch/01_MOLING_LAUNCH_MASTER_PLAN.md)
+2. [`docs/launch/02_OLD_G_PERSONA_AND_MEMORY_SPEC.md`](docs/launch/02_OLD_G_PERSONA_AND_MEMORY_SPEC.md)
+3. [`docs/launch/03_DEEPSEEK_BACKEND_AND_COST_PLAN.md`](docs/launch/03_DEEPSEEK_BACKEND_AND_COST_PLAN.md)
+4. [`docs/launch/04_STORE_SYNC_MONETIZATION_PLAN.md`](docs/launch/04_STORE_SYNC_MONETIZATION_PLAN.md)
+5. [`docs/launch/05_CODEX_FIRST_EXECUTION_PROMPT.md`](docs/launch/05_CODEX_FIRST_EXECUTION_PROMPT.md)
+
+根目录 [`AGENTS.md`](AGENTS.md) 与上述文件构成当前正式基线。
+
 ## 技术栈
 
-**Android**
+### Android
 
 - Kotlin
 - Jetpack Compose
 - Canvas / PathMeasure 墨迹动画
 - ML Kit Digital Ink Recognition
+- DataStore
+- 计划加入本地数据库与同步队列
 
-**Backend**
+### Backend
+
+当前原型：
 
 - Python
 - FastAPI
 - OpenAI Responses API
-- Pydantic
 
-## 启动后端
+冻结的生产目标：
 
-以下命令以 Windows PowerShell 为例：
+- FastAPI
+- DeepSeek OpenAI-compatible Chat Completions API
+- `deepseek-v4-flash` 默认回应
+- `deepseek-v4-pro` 深度回应
+- 供应商适配层
+- JSON Output
+- 鉴权、限流、预算和脱敏日志
+
+## 当前本地启动方式
+
+以下仅适用于当前原型开发环境，M0-A 完成后将更新。
+
+### 后端
 
 ```powershell
 cd backend
@@ -54,18 +101,6 @@ python -m venv .venv
 .\.venv\Scripts\Activate.ps1
 pip install -r requirements.txt
 Copy-Item .env.example .env
-```
-
-编辑 `backend/.env`：
-
-```env
-OPENAI_API_KEY=your_api_key_here
-OPENAI_MODEL=your_model_id_here
-```
-
-启动服务：
-
-```powershell
 uvicorn main:app --host 0.0.0.0 --port 8000
 ```
 
@@ -81,58 +116,40 @@ GET http://127.0.0.1:8000/healthz
 POST /api/notebook/reply
 ```
 
-`backend/.env` 已被 Git 忽略，不得将真实 API Key 写入代码、日志、Android 客户端或提交历史。
+真实 API Key 不得写入代码、Android 客户端、Git、日志或提交历史。
 
-## 启动 Android 客户端
+### Android
 
-1. 使用 Android Studio 打开 `moling-android/`。
-2. 等待 Gradle Sync 完成。
-3. 打开：
+1. 使用 Android Studio 打开 `moling-android/`；
+2. 等待 Gradle Sync；
+3. 当前原型仍通过 `BackendConfig.kt` 指定局域网地址；
+4. 真机与后端电脑需位于同一局域网；
+5. 执行 Build 和 Run。
 
-```text
-moling-android/app/src/main/java/com/moling/livingnotebook/data/remote/BackendConfig.kt
-```
+该流程不是生产发布方式。M0-A 必须改成 Debug/Release 环境分离，Release 只使用 HTTPS。
 
-4. 将 `BASE_URL` 改为当前开发环境地址：
-   - Android 模拟器访问本机后端：`http://10.0.2.2:8000`
-   - 真机访问电脑后端：`http://<电脑局域网IP>:8000`
-5. 确保真机与电脑位于同一局域网，再执行 Build 和 Run。
+## 已知上线阻塞
 
-首次使用本地手写识别时，ML Kit 可能需要下载语言模型。部分缺少 GMS 的设备可能无法正常完成下载，需要单独处理兼容性。
+- 后端仍是 OpenAI 原型调用；
+- Android 后端地址仍为局域网硬编码；
+- Release 仍允许明文 HTTP；
+- 无正式鉴权、限流和全局预算；
+- 生产日志可能包含用户正文；
+- Vision debug 图片可能落盘；
+- 本地笔记持久化与同步尚未完成；
+- 未建立签名 APK/AAB 和商店发布流程；
+- 华为等无 GMS 设备可能无法下载 ML Kit 模型；
+- CI、自动化测试和全新环境复现仍需完成；
+- 约 50 MB 手写字体资源仍需评估。
 
-## 当前开发边界
+## 当前下一步
 
-现阶段优先保证手写、识别、生成回复和墨迹浮现链路稳定。
+Codex 额度恢复后，直接执行：
 
-暂不优先建设：
+[`docs/launch/05_CODEX_FIRST_EXECUTION_PROMPT.md`](docs/launch/05_CODEX_FIRST_EXECUTION_PROMPT.md)
 
-- 登录与账户系统
-- 数据库和云同步
-- 支付与订阅
-- 复杂生产部署
-
-下一阶段产品方向主要是设置能力，包括回复字号、AI 回复字体、纸张背景、墨色、调试开关和本地持久化。
-
-## 已知问题
-
-- Android 后端地址仍为开发常量，需要手动修改。
-- 华为等缺少 GMS 的设备可能遇到 ML Kit 模型下载问题。
-- 仓库暂未配置完整 CI、自动化测试和发布流程。
-- 手写字体资源约 50 MB，GitHub 会给出大文件提示；后续应评估压缩、替换或迁移到 Git LFS。
-- 当前 README 仅用于基础建档，尚未完成全新环境复现验证。
-
-## 后续 Codex 建档任务
-
-后续应通过 Codex 对仓库执行一次完整的“仓库建档与可运行性核验”：
-
-1. 从全新 clone 验证 Android 与后端启动步骤。
-2. 核验依赖版本、环境变量和密钥边界。
-3. 移除或配置化硬编码的后端地址。
-4. 增加后端 smoke test 与基础 Android 测试。
-5. 建立最小 CI。
-6. 检查大字体文件的 Git LFS 或替代方案。
-7. 根据真实代码重写正式 README 和开发文档。
+首轮必须同时完成基线核验与实际代码交付，不能只输出审计报告。
 
 ## 开发规则
 
-修改代码前请先阅读 [`AGENTS.md`](./AGENTS.md)。其中定义了产品本质、关键技术路径、密钥边界和禁止破坏的体验约束。
+修改代码前必须阅读 [`AGENTS.md`](AGENTS.md)。其中定义了产品本质、DeepSeek 模型决策、老g人格、用户记忆隔离、密钥边界、上线顺序和禁止破坏的体验约束。
