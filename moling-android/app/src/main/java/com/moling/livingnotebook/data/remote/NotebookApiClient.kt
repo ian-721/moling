@@ -96,7 +96,8 @@ open class NotebookApiClient(private val baseUrl: String) {
         recognitionSource: String? = null,
         recentContext: String? = null,
         imageBase64: String? = null,
-        pageId: String? = null
+        pageId: String? = null,
+        deepMode: Boolean = false
     ): RemoteResult<NotebookReply> = request(
         method = "POST",
         path = "/api/notebook/reply",
@@ -108,6 +109,7 @@ open class NotebookApiClient(private val baseUrl: String) {
             put("recognitionSource", recognitionSource ?: JSONObject.NULL)
             put("recentContext", recentContext ?: JSONObject.NULL)
             put("imageBase64", imageBase64 ?: JSONObject.NULL)
+            put("deepMode", deepMode)
         }
     ) { json ->
         NotebookReply(
@@ -171,9 +173,13 @@ open class NotebookApiClient(private val baseUrl: String) {
 
     internal fun parseFailure(status: Int, responseText: String): RemoteResult.Failure {
         val detail = runCatching {
-            JSONObject(responseText).optJSONObject("detail")
+            JSONObject(responseText).getJSONObject("detail")
         }.getOrNull()
         val code = detail?.optString("code")?.takeIf { it.isNotBlank() }
+            ?: Regex("\"code\"\\s*:\\s*\"([A-Za-z0-9._:-]+)\"")
+                .find(responseText)
+                ?.groupValues
+                ?.get(1)
             ?: "http_$status"
         val message = detail?.optString("message")?.takeIf { it.isNotBlank() }
             ?: when (status) {
@@ -182,12 +188,17 @@ open class NotebookApiClient(private val baseUrl: String) {
                 502, 503 -> "模型服务暂时不可用"
                 else -> "后端返回错误（$status）"
             }
+        val retryable = when {
+            status == 409 -> code == "request_in_progress"
+            status == 401 || status == 408 || status == 429 -> true
+            status >= 500 -> true
+            else -> false
+        }
         return RemoteResult.Failure(
             statusCode = status,
             code = code,
             reason = message,
-            retryable = status == 401 || status == 408 || status == 409 ||
-                status == 429 || status >= 500
+            retryable = retryable
         )
     }
 }

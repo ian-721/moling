@@ -38,4 +38,20 @@ class BackendConfigTest {
             client.parseFailure(503, "").reason
         )
     }
+
+    @Test
+    fun onlyTransient409IsRetryable() {
+        val client = NotebookApiClient("https://api.moling.app")
+        fun failure(code: String) = client.parseFailure(
+            409,
+            """{"detail":{"code":"$code","message":"conflict"}}"""
+        )
+
+        assertEquals("request_in_progress", failure("request_in_progress").code)
+        assertTrue(failure("request_in_progress").retryable)
+        assertFalse(failure("idempotency_conflict").retryable)
+        assertFalse(failure("request_permanently_failed").retryable)
+        assertFalse(failure("request_attempt_limit_exceeded").retryable)
+        assertFalse(failure("request_outcome_unknown").retryable)
+    }
 }

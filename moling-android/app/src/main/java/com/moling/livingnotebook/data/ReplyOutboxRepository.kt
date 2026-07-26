@@ -15,6 +15,10 @@ data class PendingReply(
     val strokeIds: List<String>,
     val recognizedText: String,
     val recognitionSource: String,
+    val recentContext: String?,
+    val deepMode: Boolean,
+    val payloadFrozen: Boolean,
+    val isReplayable: Boolean,
     val state: LocalRequestState,
     val attemptCount: Int
 )
@@ -33,6 +37,16 @@ class ReplyOutboxRepository(
         require(strokeIds.isNotEmpty()) { "reply snapshot requires strokes" }
         val now = clock()
         database.withTransaction {
+            val persisted = dao.snapshotStrokes(pageId, strokeIds)
+            require(persisted.size == strokeIds.size) {
+                "reply snapshot contains strokes that are not persisted"
+            }
+            require(persisted.all { it.state == "ACTIVE" }) {
+                "reply snapshot contains non-editable strokes"
+            }
+            require(persisted.map { it.strokeId }.toSet() == strokeIds.toSet()) {
+                "reply snapshot stroke identity mismatch"
+            }
             dao.updateStrokeState(strokeIds, "SENDING")
             dao.upsertTurn(
                 NotebookTurnEntity(
@@ -58,6 +72,12 @@ class ReplyOutboxRepository(
                     attemptCount = 0,
                     lastErrorCategory = null,
                     nextRetryAt = null,
+                    recognizedText = "",
+                    recognitionSource = "",
+                    recentContext = null,
+                    deepMode = false,
+                    payloadFrozen = false,
+                    isReplayable = true,
                     createdAt = now,
                     updatedAt = now
                 )
@@ -68,8 +88,10 @@ class ReplyOutboxRepository(
     suspend fun markRecognized(
         requestId: String,
         text: String,
-        source: String
-    ) {
+        source: String,
+        recentContext: String?,
+        deepMode: Boolean
+    ): PendingReply {
         database.withTransaction {
             val turn = requireNotNull(dao.turnForRequest(requestId))
             val outbox = requireNotNull(dao.outbox(requestId))
@@ -85,7 +107,27 @@ class ReplyOutboxRepository(
             dao.upsertOutbox(
                 outbox.copy(
                     state = LocalRequestState.READY_TO_SEND.name,
+                    recognizedText = text,
+                    recognitionSource = source,
+                    recentContext = recentContext,
+                    deepMode = deepMode,
+                    payloadFrozen = true,
+                    isReplayable = true,
                     updatedAt = now
+                )
+            )
+        }
+        return requireNotNull(pendingForRequest(requestId))
+    }
+
+    suspend fun markVisionNonReplayable(requestId: String) {
+        database.withTransaction {
+            val outbox = requireNotNull(dao.outbox(requestId))
+            dao.upsertOutbox(
+                outbox.copy(
+                    payloadFrozen = true,
+                    isReplayable = false,
+                    updatedAt = clock()
                 )
             )
         }
@@ -164,13 +206,33 @@ class ReplyOutboxRepository(
 
     suspend fun pending(pageId: String): PendingReply? {
         val outbox = dao.pendingOutbox(pageId) ?: return null
-        val turn = dao.turnForRequest(outbox.requestId)
         return PendingReply(
             requestId = outbox.requestId,
             pageId = outbox.pageId,
             strokeIds = decodeIds(outbox.strokeIdsJson),
-            recognizedText = turn?.recognizedText.orEmpty(),
-            recognitionSource = turn?.recognitionSource.orEmpty(),
+            recognizedText = outbox.recognizedText,
+            recognitionSource = outbox.recognitionSource,
+            recentContext = outbox.recentContext,
+            deepMode = outbox.deepMode,
+            payloadFrozen = outbox.payloadFrozen,
+            isReplayable = outbox.isReplayable,
+            state = LocalRequestState.valueOf(outbox.state),
+            attemptCount = outbox.attemptCount
+        )
+    }
+
+    private suspend fun pendingForRequest(requestId: String): PendingReply? {
+        val outbox = dao.outbox(requestId) ?: return null
+        return PendingReply(
+            requestId = outbox.requestId,
+            pageId = outbox.pageId,
+            strokeIds = decodeIds(outbox.strokeIdsJson),
+            recognizedText = outbox.recognizedText,
+            recognitionSource = outbox.recognitionSource,
+            recentContext = outbox.recentContext,
+            deepMode = outbox.deepMode,
+            payloadFrozen = outbox.payloadFrozen,
+            isReplayable = outbox.isReplayable,
             state = LocalRequestState.valueOf(outbox.state),
             attemptCount = outbox.attemptCount
         )

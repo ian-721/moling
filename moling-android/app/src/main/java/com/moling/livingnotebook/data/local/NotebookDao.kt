@@ -27,6 +27,14 @@ interface NotebookDao {
     suspend fun strokes(pageId: String): List<StrokeEntity>
 
     @Query(
+        "SELECT * FROM strokes WHERE pageId = :pageId AND strokeId IN (:strokeIds)"
+    )
+    suspend fun snapshotStrokes(
+        pageId: String,
+        strokeIds: List<String>
+    ): List<StrokeEntity>
+
+    @Query(
         "SELECT * FROM strokes WHERE pageId = :pageId AND state = 'ACTIVE' " +
             "ORDER BY strokeOrder DESC LIMIT 1"
     )
@@ -78,10 +86,4 @@ interface NotebookDao {
     )
     suspend fun pendingOutbox(pageId: String): ReplyOutboxEntity?
 
-    @Query(
-        "UPDATE reply_outbox SET state = 'RETRYABLE_FAILED', " +
-            "lastErrorCategory = 'process_restarted', updatedAt = :now " +
-            "WHERE state = 'SENDING'"
-    )
-    suspend fun recoverSendingAfterRestart(now: Long)
 }

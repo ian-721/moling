@@ -23,7 +23,11 @@ data class PreparedReply(
     val pageId: String,
     val strokeIds: List<String>,
     val recognizedText: String?,
-    val recognitionSource: String?
+    val recognitionSource: String?,
+    val recentContext: String?,
+    val deepMode: Boolean,
+    val payloadFrozen: Boolean,
+    val isReplayable: Boolean
 )
 
 internal fun shouldApplyResponse(
@@ -127,8 +131,9 @@ class NotebookViewModel(
         currentStroke = null
         if (stroke.points.isEmpty()) return
         strokes.add(stroke)
+        val write = notebookRepository.enqueueStroke(pageId, stroke)
         viewModelScope.launch {
-            runCatching { notebookRepository.persistStroke(pageId, stroke) }
+            write.await()
                 .onFailure {
                     errorMessage = "这笔墨迹尚未安全保存，请停止继续操作并重试"
                 }
@@ -137,6 +142,10 @@ class NotebookViewModel(
 
     fun undo() {
         viewModelScope.launch {
+            if (notebookRepository.awaitPendingStrokeWrites().isFailure) {
+                errorMessage = "墨迹尚未安全保存，无法撤销"
+                return@launch
+            }
             val removedId = runCatching { notebookRepository.undo(pageId) }.getOrNull()
             if (removedId != null) strokes.removeAll { it.id == removedId }
         }
@@ -144,6 +153,10 @@ class NotebookViewModel(
 
     fun clear() {
         viewModelScope.launch {
+            if (notebookRepository.awaitPendingStrokeWrites().isFailure) {
+                errorMessage = "墨迹尚未安全保存，无法清理纸面"
+                return@launch
+            }
             runCatching { notebookRepository.clearEditable(pageId) }
                 .onSuccess {
                     strokes.removeAll { it.id !in activeStrokeIds }
@@ -160,6 +173,10 @@ class NotebookViewModel(
     }
 
     suspend fun prepareReply(): PreparedReply? {
+        if (notebookRepository.awaitPendingStrokeWrites().isFailure) {
+            errorMessage = "墨迹尚未安全保存，请勿发送"
+            return null
+        }
         val pending = outboxRepository.pending(pageId)
         if (pending != null) {
             activeRequestId = pending.requestId
@@ -172,7 +189,11 @@ class NotebookViewModel(
                 pageId = pending.pageId,
                 strokeIds = pending.strokeIds,
                 recognizedText = pending.recognizedText.takeIf { it.isNotBlank() },
-                recognitionSource = pending.recognitionSource.takeIf { it.isNotBlank() }
+                recognitionSource = pending.recognitionSource.takeIf { it.isNotBlank() },
+                recentContext = pending.recentContext,
+                deepMode = pending.deepMode,
+                payloadFrozen = pending.payloadFrozen,
+                isReplayable = pending.isReplayable
             )
         }
         val ids = strokes.map { it.id }
@@ -188,19 +209,56 @@ class NotebookViewModel(
             isLoading = true
             errorMessage = null
             inkPhase = InkPhase.Sending
-            PreparedReply(requestId, pageId, ids, null, null)
+            PreparedReply(
+                requestId,
+                pageId,
+                ids,
+                null,
+                null,
+                null,
+                false,
+                false,
+                true
+            )
         }.getOrElse {
             errorMessage = "请求快照保存失败，笔迹未发送"
             null
         }
     }
 
-    suspend fun onLocalRecognition(requestId: String, text: String, source: String) {
-        outboxRepository.markRecognized(requestId, text, source)
+    suspend fun onLocalRecognition(
+        requestId: String,
+        text: String,
+        source: String,
+        recentContext: String?,
+        deepMode: Boolean
+    ): PreparedReply {
+        val pending = outboxRepository.markRecognized(
+            requestId,
+            text,
+            source,
+            recentContext,
+            deepMode
+        )
         if (requestId == activeRequestId) {
             recognizedText = text
             recognitionSource = source
         }
+        return PreparedReply(
+            pending.requestId,
+            pending.pageId,
+            pending.strokeIds,
+            pending.recognizedText,
+            pending.recognitionSource,
+            pending.recentContext,
+            pending.deepMode,
+            pending.payloadFrozen,
+            pending.isReplayable
+        )
+    }
+
+    suspend fun markVisionNonReplayable(requestId: String) {
+        outboxRepository.markVisionNonReplayable(requestId)
     }
 
     suspend fun markSending(requestId: String) {

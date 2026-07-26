@@ -93,6 +93,12 @@ data class ReplyOutboxEntity(
     val attemptCount: Int,
     val lastErrorCategory: String?,
     val nextRetryAt: Long?,
+    val recognizedText: String,
+    val recognitionSource: String,
+    val recentContext: String?,
+    val deepMode: Boolean,
+    val payloadFrozen: Boolean,
+    val isReplayable: Boolean,
     val createdAt: Long,
     val updatedAt: Long
 )

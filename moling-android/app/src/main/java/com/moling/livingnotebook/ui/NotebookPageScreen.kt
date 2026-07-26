@@ -111,8 +111,6 @@ fun NotebookPageScreen(modifier: Modifier = Modifier) {
 
     suspend fun sendReply(
         prepared: PreparedReply,
-        recognizedText: String?,
-        recognitionSource: String?,
         imageBase64: String?
     ) {
         val firstAuth = container.authSessionRepository.accessToken()
@@ -131,11 +129,12 @@ fun NotebookPageScreen(modifier: Modifier = Modifier) {
             container.apiClient.requestNotebookReply(
                 token = token,
                 requestId = prepared.requestId,
-                recognizedText = recognizedText,
-                recognitionSource = recognitionSource,
-                recentContext = viewModel.buildRecentContext(settings.assistantName),
+                recognizedText = prepared.recognizedText,
+                recognitionSource = prepared.recognitionSource,
+                recentContext = prepared.recentContext,
                 imageBase64 = imageBase64,
-                pageId = prepared.pageId
+                pageId = prepared.pageId,
+                deepMode = prepared.deepMode
             )
 
         var result = call(firstAuth.accessToken)
@@ -165,7 +164,7 @@ fun NotebookPageScreen(modifier: Modifier = Modifier) {
                 requestId = prepared.requestId,
                 reason = result.reason,
                 category = result.code,
-                retryable = result.retryable
+                retryable = result.retryable && prepared.isReplayable
             )
         }
     }
@@ -175,22 +174,19 @@ fun NotebookPageScreen(modifier: Modifier = Modifier) {
             val prepared = viewModel.prepareReply() ?: return@launch
             val selectedStrokes = viewModel.strokesFor(prepared.strokeIds)
             if (prepared.recognizedText != null) {
-                sendReply(
-                    prepared,
-                    prepared.recognizedText,
-                    prepared.recognitionSource,
-                    null
-                )
+                sendReply(prepared, null)
                 return@launch
             }
             when (val recognition = InkRecognitionService.recognize(selectedStrokes)) {
                 is InkRecognitionResult.Success -> {
-                    viewModel.onLocalRecognition(
+                    val frozen = viewModel.onLocalRecognition(
                         prepared.requestId,
                         recognition.text,
-                        "mlkit"
+                        "mlkit",
+                        viewModel.buildRecentContext(settings.assistantName),
+                        deepMode = false
                     )
-                    sendReply(prepared, recognition.text, "mlkit", null)
+                    sendReply(frozen, null)
                 }
                 is InkRecognitionResult.Failure -> {
                     if (BackendConfig.ENABLE_VISION_FALLBACK_FOR_DEV) {
@@ -199,10 +195,12 @@ fun NotebookPageScreen(modifier: Modifier = Modifier) {
                             widthPx = canvasSize.width,
                             heightPx = canvasSize.height
                         )
+                        viewModel.markVisionNonReplayable(prepared.requestId)
                         sendReply(
-                            prepared,
-                            null,
-                            null,
+                            prepared.copy(
+                                payloadFrozen = true,
+                                isReplayable = false
+                            ),
                             bitmap.toPngBase64()
                         )
                     } else {

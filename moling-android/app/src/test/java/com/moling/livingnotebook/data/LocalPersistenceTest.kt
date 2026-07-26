@@ -7,10 +7,16 @@ import com.moling.livingnotebook.data.local.LocalRequestState
 import com.moling.livingnotebook.data.local.MolingDatabase
 import com.moling.livingnotebook.drawing.Stroke
 import com.moling.livingnotebook.drawing.StrokePoint
+import com.moling.livingnotebook.viewmodel.NotebookViewModel
 import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.async
 import org.junit.After
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotNull
+import org.junit.Assert.assertThrows
 import org.junit.Assert.assertTrue
 import org.junit.Before
 import org.junit.Test
@@ -53,7 +59,7 @@ class LocalPersistenceTest {
 
         val restored = notebook.restore("page").strokes.single()
         assertEquals(stroke, restored)
-        assertEquals(1, database.openHelper.readableDatabase.version)
+        assertEquals(2, database.openHelper.readableDatabase.version)
     }
 
     @Test
@@ -62,7 +68,13 @@ class LocalPersistenceTest {
             val sent = stroke("sent")
             notebook.persistStroke("page", sent)
             outbox.createSnapshot("request-one", "page", listOf(sent.id))
-            outbox.markRecognized("request-one", "旧内容", "mlkit")
+            outbox.markRecognized(
+                "request-one",
+                "旧内容",
+                "mlkit",
+                "原上下文",
+                false
+            )
             outbox.markSending("request-one")
 
             val writtenDuringReply = stroke("new")
@@ -89,7 +101,13 @@ class LocalPersistenceTest {
         val failedStroke = stroke("failed")
         notebook.persistStroke("page", failedStroke)
         outbox.createSnapshot("same-request", "page", listOf(failedStroke.id))
-        outbox.markRecognized("same-request", "内容", "mlkit")
+        outbox.markRecognized(
+            "same-request",
+            "内容",
+            "mlkit",
+            "冻结上下文",
+            false
+        )
         outbox.markSending("same-request")
 
         // restore() converts interrupted SENDING to a retryable durable outbox.
@@ -112,7 +130,13 @@ class LocalPersistenceTest {
         val interrupted = stroke("interrupted")
         notebook.persistStroke("page", interrupted)
         outbox.createSnapshot("restart-request", "page", listOf(interrupted.id))
-        outbox.markRecognized("restart-request", "内容", "mlkit")
+        outbox.markRecognized(
+            "restart-request",
+            "内容",
+            "mlkit",
+            null,
+            false
+        )
         outbox.markSending("restart-request")
 
         notebook.restore("page")
@@ -133,6 +157,158 @@ class LocalPersistenceTest {
         assertEquals(listOf("one"), notebook.restore("page").strokes.map { it.id })
         notebook.clearEditable("page")
         assertTrue(notebook.restore("page").strokes.isEmpty())
+    }
+
+    @Test
+    fun pendingWriteBarrierProtectsSnapshot() = runBlocking {
+        val gate = CompletableDeferred<Unit>()
+        val delayed = NotebookRepository(
+            database,
+            clock = { 1_000L },
+            beforeStrokeWrite = { gate.await() }
+        )
+        val queued = delayed.enqueueStroke("page", stroke("queued"))
+        val snapshot = async(Dispatchers.Default) {
+            delayed.awaitPendingStrokeWrites().getOrThrow()
+            outbox.createSnapshot("queued-request", "page", listOf("queued"))
+        }
+        assertFalse(queued.isCompleted)
+        assertFalse(snapshot.isCompleted)
+
+        gate.complete(Unit)
+        queued.await().getOrThrow()
+        snapshot.await()
+        assertEquals(
+            listOf("queued"),
+            delayed.restore("page").strokes.map { it.id }
+        )
+    }
+
+    @Test
+    fun immediateUndoWaitsForPendingWriteThenRemovesNewestStroke() = runBlocking {
+        val gate = CompletableDeferred<Unit>()
+        val delayed = NotebookRepository(
+            database,
+            beforeStrokeWrite = { gate.await() }
+        )
+        delayed.enqueueStroke("page", stroke("undo-pending"))
+        val undoing = async(Dispatchers.Default) {
+            delayed.awaitPendingStrokeWrites().getOrThrow()
+            delayed.undo("page")
+        }
+        assertFalse(undoing.isCompleted)
+        gate.complete(Unit)
+        assertEquals("undo-pending", undoing.await())
+        assertTrue(delayed.restore("page").strokes.isEmpty())
+    }
+
+    @Test
+    fun immediateClearWaitsForPendingWriteThenClearsIt() = runBlocking {
+        val gate = CompletableDeferred<Unit>()
+        val delayed = NotebookRepository(
+            database,
+            beforeStrokeWrite = { gate.await() }
+        )
+        delayed.enqueueStroke("page", stroke("clear-pending"))
+        val clearing = async(Dispatchers.Default) {
+            delayed.awaitPendingStrokeWrites().getOrThrow()
+            delayed.clearEditable("page")
+        }
+        assertFalse(clearing.isCompleted)
+        gate.complete(Unit)
+        clearing.await()
+        assertTrue(delayed.restore("page").strokes.isEmpty())
+    }
+
+    @Test
+    fun endStrokeThenImmediateReplyWaitsForDurableStroke() = runBlocking {
+        val gate = CompletableDeferred<Unit>()
+        val delayed = NotebookRepository(
+            database,
+            clock = { 1_000L },
+            beforeStrokeWrite = { gate.await() }
+        )
+        val viewModel = NotebookViewModel(delayed, outbox, "page")
+        viewModel.beginStroke(1f, 2f)
+        viewModel.appendPoint(3f, 4f)
+        viewModel.endStroke()
+
+        val preparing = async(Dispatchers.Default) { viewModel.prepareReply() }
+        assertFalse(preparing.isCompleted)
+        gate.complete(Unit)
+        val prepared = preparing.await()
+        assertNotNull(prepared)
+        assertEquals(
+            prepared?.strokeIds,
+            database.notebookDao().strokes("page").map { it.strokeId }
+        )
+    }
+
+    @Test
+    fun failedStrokeWriteBlocksSnapshotInsteadOfPretendingItPersisted() {
+        runBlocking {
+            val failed = NotebookRepository(
+                database,
+                beforeStrokeWrite = { error("disk full") }
+            )
+            failed.enqueueStroke("page", stroke("lost")).await()
+            assertTrue(failed.awaitPendingStrokeWrites().isFailure)
+            assertThrows(IllegalArgumentException::class.java) {
+                runBlocking {
+                    outbox.createSnapshot(
+                        "must-not-send",
+                        "page",
+                        listOf("lost")
+                    )
+                }
+            }
+        }
+    }
+
+    @Test
+    fun retryPayloadRemainsFrozenAcrossContextChangesAndRestart() = runBlocking {
+        notebook.persistStroke("page", stroke("frozen"))
+        outbox.createSnapshot("frozen-request", "page", listOf("frozen"))
+        outbox.markRecognized(
+            "frozen-request",
+            "第一次识别",
+            "mlkit",
+            "改名前的上下文",
+            true
+        )
+        outbox.markSending("frozen-request")
+        outbox.markFailure("frozen-request", "network_error", retryable = true)
+
+        val retry = ReplyOutboxRepository(database) { 9_999L }.pending("page")
+        assertEquals("frozen-request", retry?.requestId)
+        assertEquals("第一次识别", retry?.recognizedText)
+        assertEquals("mlkit", retry?.recognitionSource)
+        assertEquals("改名前的上下文", retry?.recentContext)
+        assertEquals(true, retry?.deepMode)
+        assertEquals(true, retry?.payloadFrozen)
+    }
+
+    @Test
+    fun permanentFailureAllowsNewUserActionWithNewRequestId() = runBlocking {
+        notebook.persistStroke("page", stroke("retry-new-id"))
+        outbox.createSnapshot(
+            "permanent-request",
+            "page",
+            listOf("retry-new-id")
+        )
+        outbox.markFailure(
+            "permanent-request",
+            "idempotency_conflict",
+            retryable = false
+        )
+        assertEquals(null, outbox.pending("page"))
+
+        outbox.createSnapshot(
+            "new-user-action",
+            "page",
+            listOf("retry-new-id")
+        )
+        assertEquals("new-user-action", outbox.pending("page")?.requestId)
     }
 
     private fun stroke(id: String) = Stroke(

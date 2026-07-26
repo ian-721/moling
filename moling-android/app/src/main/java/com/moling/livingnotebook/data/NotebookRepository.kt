@@ -9,6 +9,11 @@ import com.moling.livingnotebook.data.local.decodeIds
 import com.moling.livingnotebook.data.local.decodeStrokePoints
 import com.moling.livingnotebook.data.local.encodeStrokePoints
 import com.moling.livingnotebook.drawing.Stroke
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Deferred
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.async
 
 data class NotebookRestore(
     val pageId: String,
@@ -26,9 +31,13 @@ data class RestoredTurn(
 
 class NotebookRepository(
     private val database: MolingDatabase,
-    private val clock: () -> Long = System::currentTimeMillis
+    private val clock: () -> Long = System::currentTimeMillis,
+    private val beforeStrokeWrite: suspend () -> Unit = {}
 ) {
     private val dao = database.notebookDao()
+    private val persistenceScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+    private val writeLock = Any()
+    private var writeTail: Deferred<Result<Unit>>? = null
 
     suspend fun ensurePage(pageId: String) {
         val now = clock()
@@ -50,8 +59,36 @@ class NotebookRepository(
                 if (strokeIds.isNotEmpty()) {
                     dao.updateStrokeState(strokeIds, "ACTIVE")
                 }
+                val replayable = outbox.isReplayable
+                dao.turnForRequest(outbox.requestId)?.let { turn ->
+                    dao.upsertTurn(
+                        turn.copy(
+                            state = if (replayable) {
+                                LocalRequestState.RETRYABLE_FAILED.name
+                            } else {
+                                LocalRequestState.PERMANENT_FAILED.name
+                            },
+                            updatedAt = clock()
+                        )
+                    )
+                }
+                dao.upsertOutbox(
+                    outbox.copy(
+                        state = if (replayable) {
+                            LocalRequestState.RETRYABLE_FAILED.name
+                        } else {
+                            LocalRequestState.PERMANENT_FAILED.name
+                        },
+                        lastErrorCategory = if (replayable) {
+                            "process_restarted"
+                        } else {
+                            "non_replayable_payload_interrupted"
+                        },
+                        nextRetryAt = if (replayable) clock() else null,
+                        updatedAt = clock()
+                    )
+                )
             }
-            dao.recoverSendingAfterRestart(clock())
         }
         val reply = dao.latestUnabsorbedSuccess(pageId)
         return NotebookRestore(
@@ -75,6 +112,7 @@ class NotebookRepository(
     }
 
     suspend fun persistStroke(pageId: String, stroke: Stroke) {
+        beforeStrokeWrite()
         database.withTransaction {
             ensurePage(pageId)
             dao.insertStroke(
@@ -90,6 +128,24 @@ class NotebookRepository(
                 )
             )
         }
+    }
+
+    fun enqueueStroke(pageId: String, stroke: Stroke): Deferred<Result<Unit>> =
+        synchronized(writeLock) {
+            val previous = writeTail
+            persistenceScope.async {
+                val previousResult = previous?.await()
+                if (previousResult?.isFailure == true) {
+                    previousResult
+                } else {
+                    runCatching { persistStroke(pageId, stroke) }
+                }
+            }.also { writeTail = it }
+        }
+
+    suspend fun awaitPendingStrokeWrites(): Result<Unit> {
+        val pending = synchronized(writeLock) { writeTail }
+        return pending?.await() ?: Result.success(Unit)
     }
 
     suspend fun undo(pageId: String): String? = database.withTransaction {
