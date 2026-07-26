@@ -1,18 +1,26 @@
 from __future__ import annotations
 
-import logging
 import asyncio
+import json
+import logging
 import threading
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
+from decimal import Decimal
 
+import httpx
+import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy import select
+from sqlalchemy.dialects import postgresql, sqlite
 
 from app.api import create_app
 from app.db_models import (
     AccessToken,
+    DeviceInstallation,
     GlobalBudgetWindow,
+    Principal,
+    RegistrationWindow,
     ReplyRequest,
     UsageWindow,
 )
@@ -23,8 +31,10 @@ from app.providers.base import (
     ProviderError,
     TokenUsage,
 )
+from app.providers.deepseek import DeepSeekProvider
+from app.services.auth_service import _registration_insert_statement
 from app.services.request_service import request_fingerprint
-from app.services.usage_service import UsageService
+from app.services.usage_service import UsageService, with_estimated_cost
 
 
 class CapturingProvider:
@@ -86,6 +96,15 @@ def payload(**overrides: object) -> dict[str, object]:
     }
     body.update(overrides)
     return body
+
+
+def file_database_settings(test_settings, tmp_path, **overrides: object):
+    values = {
+        **test_settings.__dict__,
+        "database_url": f"sqlite:///{(tmp_path / 'moling-test.db').as_posix()}",
+        **overrides,
+    }
+    return test_settings.__class__(**values)
 
 
 def test_health_and_readiness_do_not_expose_usage(test_settings) -> None:
@@ -578,6 +597,298 @@ def test_monthly_quota_and_provider_usage_settlement(test_settings) -> None:
                 assert window.estimated_cost_cny > 0
             assert budget.reserved_cost_cny == 0
             assert budget.settled_cost_cny == month.estimated_cost_cny
+
+
+def test_mixed_model_cost_settles_request_usage_and_budget(
+    test_settings,
+    tmp_path,
+) -> None:
+    models: list[str] = []
+
+    def handler(http_request: httpx.Request) -> httpx.Response:
+        request_body = json.loads(http_request.content)
+        models.append(request_body["model"])
+        usage = {
+            "prompt_tokens": 100,
+            "completion_tokens": 20,
+            "prompt_cache_hit_tokens": 60,
+        }
+        if len(models) == 1:
+            return httpx.Response(
+                503,
+                json={"error": {"message": "private"}, "usage": usage},
+            )
+        return httpx.Response(
+            200,
+            json={
+                "choices": [
+                    {
+                        "message": {
+                            "content": json.dumps(
+                                {
+                                    "reply": "先验证最小的一步。",
+                                    "mode": "execution",
+                                    "safety_level": "normal",
+                                    "should_ask": False,
+                                    "memory_candidates": [],
+                                }
+                            )
+                        }
+                    }
+                ],
+                "usage": usage,
+            },
+        )
+
+    settings = file_database_settings(
+        test_settings,
+        tmp_path,
+        model_provider="deepseek",
+        deepseek_api_key="fake-test-key",
+        retry_count=1,
+    )
+    provider = DeepSeekProvider(
+        settings,
+        transport=httpx.MockTransport(handler),
+    )
+    app = create_app(settings=settings, provider=provider)
+    with TestClient(app) as client:
+        token = register(client)
+        response = client.post(
+            "/api/notebook/reply",
+            headers=bearer(token),
+            json=payload(deepMode=True),
+        )
+        assert response.status_code == 200, response.text
+
+    attempt_usage = TokenUsage(
+        input_tokens=100,
+        output_tokens=20,
+        cache_hit_tokens=60,
+    )
+    pro_cost = with_estimated_cost(
+        attempt_usage,
+        deep_mode=True,
+    ).estimated_cost_cny
+    flash_cost = with_estimated_cost(
+        attempt_usage,
+        deep_mode=False,
+    ).estimated_cost_cny
+    expected_cost = Decimal(str(pro_cost + flash_cost))
+
+    assert models == ["deepseek-v4-pro", "deepseek-v4-flash"]
+    with app.state.session_factory() as session:
+        request_row = session.scalar(select(ReplyRequest))
+        day = session.scalar(
+            select(UsageWindow).where(UsageWindow.window_kind == "day")
+        )
+        month = session.scalar(
+            select(UsageWindow).where(UsageWindow.window_kind == "month")
+        )
+        budget = session.scalar(select(GlobalBudgetWindow))
+        assert request_row is not None
+        assert day is not None
+        assert month is not None
+        assert budget is not None
+        for record in (request_row, day, month):
+            assert record.input_tokens == 200
+            assert record.output_tokens == 40
+            assert record.cache_tokens == 120
+            assert record.estimated_cost_cny == expected_cost
+        assert budget.reserved_cost_cny == 0
+        assert budget.settled_cost_cny == expected_cost
+
+
+def test_provider_error_known_cost_is_not_repriced(
+    test_settings,
+    tmp_path,
+) -> None:
+    trusted_cost = 0.12345678
+
+    class CostedFailureProvider(CapturingProvider):
+        async def generate_reply(self, request: ModelRequest) -> ModelResponse:
+            raise ProviderError(
+                "provider_unavailable",
+                retriable=False,
+                usage=TokenUsage(
+                    input_tokens=100,
+                    output_tokens=20,
+                    cache_hit_tokens=60,
+                    estimated_cost_cny=trusted_cost,
+                ),
+            )
+
+    app = create_app(
+        settings=file_database_settings(test_settings, tmp_path),
+        provider=CostedFailureProvider(),
+    )
+    with TestClient(app) as client:
+        token = register(client)
+        response = client.post(
+            "/api/notebook/reply",
+            headers=bearer(token),
+            json=payload(deepMode=True),
+        )
+        assert response.status_code == 502
+
+    expected_cost = Decimal("0.12345678")
+    with app.state.session_factory() as session:
+        request_row = session.scalar(select(ReplyRequest))
+        day = session.scalar(
+            select(UsageWindow).where(UsageWindow.window_kind == "day")
+        )
+        month = session.scalar(
+            select(UsageWindow).where(UsageWindow.window_kind == "month")
+        )
+        budget = session.scalar(select(GlobalBudgetWindow))
+        assert request_row is not None
+        assert day is not None
+        assert month is not None
+        assert budget is not None
+        assert request_row.estimated_cost_cny == expected_cost
+        assert day.estimated_cost_cny == expected_cost
+        assert month.estimated_cost_cny == expected_cost
+        assert budget.settled_cost_cny == expected_cost
+
+
+def test_registration_window_atomic_insert_contracts() -> None:
+    now = datetime(2026, 7, 26, 12, 34, 56, tzinfo=timezone.utc)
+    window_start = now.replace(second=0, microsecond=0)
+    postgres_sql = str(
+        _registration_insert_statement(
+            "postgresql",
+            window_start=window_start,
+            now=now,
+        ).compile(dialect=postgresql.dialect())
+    ).upper()
+    sqlite_sql = str(
+        _registration_insert_statement(
+            "sqlite",
+            window_start=window_start,
+            now=now,
+        ).compile(dialect=sqlite.dialect())
+    ).upper()
+    for statement in (postgres_sql, sqlite_sql):
+        assert "INSERT INTO REGISTRATION_WINDOWS" in statement
+        assert "ON CONFLICT" in statement
+        assert "DO NOTHING" in statement
+
+
+def test_concurrent_distinct_registrations_share_atomic_window(
+    test_settings,
+    tmp_path,
+) -> None:
+    settings = file_database_settings(
+        test_settings,
+        tmp_path,
+        registration_requests_per_minute=8,
+    )
+    now = datetime(2026, 7, 26, 12, 34, 56, tzinfo=timezone.utc)
+    app = create_app(settings=settings, clock=lambda: now)
+    installation_ids = [
+        f"{index:08d}-1234-1234-1234-{index:012d}"
+        for index in range(1, 7)
+    ]
+    with TestClient(app) as client:
+        with ThreadPoolExecutor(max_workers=6) as executor:
+            responses = list(
+                executor.map(
+                    lambda installation_id: client.post(
+                        "/api/auth/device/register",
+                        json={"installationId": installation_id},
+                    ),
+                    installation_ids,
+                )
+            )
+
+    assert [response.status_code for response in responses] == [200] * 6
+    with app.state.session_factory() as session:
+        window = session.get(
+            RegistrationWindow,
+            now.replace(second=0, microsecond=0),
+        )
+        assert window is not None
+        assert window.request_count == 6
+        assert len(list(session.scalars(select(Principal)))) == 6
+        assert len(list(session.scalars(select(DeviceInstallation)))) == 6
+
+
+def test_concurrent_registration_limit_is_stable(
+    test_settings,
+    tmp_path,
+) -> None:
+    settings = file_database_settings(
+        test_settings,
+        tmp_path,
+        registration_requests_per_minute=3,
+    )
+    now = datetime(2026, 7, 26, 12, 34, 56, tzinfo=timezone.utc)
+    app = create_app(settings=settings, clock=lambda: now)
+    installation_ids = [
+        f"{index:08d}-2234-2234-2234-{index:012d}"
+        for index in range(1, 6)
+    ]
+    with TestClient(app) as client:
+        with ThreadPoolExecutor(max_workers=5) as executor:
+            responses = list(
+                executor.map(
+                    lambda installation_id: client.post(
+                        "/api/auth/device/register",
+                        json={"installationId": installation_id},
+                    ),
+                    installation_ids,
+                )
+            )
+
+    status_codes = [response.status_code for response in responses]
+    assert status_codes.count(200) == 3
+    assert status_codes.count(429) == 2
+    assert all(
+        response.json()["detail"]["code"] == "registration_rate_limited"
+        for response in responses
+        if response.status_code == 429
+    )
+    with app.state.session_factory() as session:
+        window = session.get(
+            RegistrationWindow,
+            now.replace(second=0, microsecond=0),
+        )
+        assert window is not None
+        assert window.request_count == 3
+
+
+def test_concurrent_same_installation_has_one_safe_registration(
+    test_settings,
+    tmp_path,
+) -> None:
+    settings = file_database_settings(test_settings, tmp_path)
+    now = datetime(2026, 7, 26, 12, 34, 56, tzinfo=timezone.utc)
+    app = create_app(settings=settings, clock=lambda: now)
+    with TestClient(app) as client:
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            responses = list(
+                executor.map(
+                    lambda _: client.post(
+                        "/api/auth/device/register",
+                        json={"installationId": INSTALLATION_A},
+                    ),
+                    range(2),
+                )
+            )
+
+    status_codes = sorted(response.status_code for response in responses)
+    assert status_codes == [200, 409]
+    conflict = next(
+        response for response in responses if response.status_code == 409
+    )
+    assert (
+        conflict.json()["detail"]["code"]
+        == "installation_already_registered"
+    )
+    with app.state.session_factory() as session:
+        assert len(list(session.scalars(select(Principal)))) == 1
+        assert len(list(session.scalars(select(DeviceInstallation)))) == 1
+        assert len(list(session.scalars(select(AccessToken)))) == 1
 
 
 def test_concurrent_same_request_id_uses_one_provider_call_and_one_charge(

@@ -77,7 +77,11 @@ def create_app(
     active_provider = provider or _provider_for(active_settings)
     active_engine = engine or create_database_engine(active_settings)
     session_factory = create_session_factory(active_engine)
-    auth_service = AuthService(active_settings, session_factory)
+    auth_service = AuthService(
+        active_settings,
+        session_factory,
+        clock=clock,
+    )
     reply_service = ReplyService(active_settings, active_provider)
     request_service = RequestService(
         active_settings,

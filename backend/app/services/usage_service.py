@@ -279,6 +279,12 @@ class UsageService:
 
 
 def with_estimated_cost(usage: TokenUsage, *, deep_mode: bool) -> TokenUsage:
+    # DeepSeek prices every attempt with its actual model before usage is
+    # accumulated. Preserve that authoritative mixed-model total. Providers
+    # that do not report a cost (including FakeProvider) use this single-model
+    # fallback exactly once.
+    if usage.estimated_cost_cny > 0:
+        return usage
     uncached = max(usage.input_tokens - usage.cache_hit_tokens, 0)
     if deep_mode:
         input_rate, cache_rate, output_rate = (

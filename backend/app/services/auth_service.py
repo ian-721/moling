@@ -3,10 +3,14 @@ from __future__ import annotations
 import hashlib
 import hmac
 import secrets
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 
 from sqlalchemy import func, select
+from sqlalchemy.dialects.mysql import insert as mysql_insert
+from sqlalchemy.dialects.postgresql import insert as postgresql_insert
+from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, sessionmaker
 
@@ -51,12 +55,71 @@ def _minute_start(now: datetime) -> datetime:
     return now.replace(second=0, microsecond=0)
 
 
+def _registration_insert_statement(
+    dialect: str,
+    *,
+    window_start: datetime,
+    now: datetime,
+):
+    values = {
+        "window_start": window_start,
+        "request_count": 0,
+        "updated_at": now,
+    }
+    if dialect == "postgresql":
+        return (
+            postgresql_insert(RegistrationWindow)
+            .values(**values)
+            .on_conflict_do_nothing(index_elements=["window_start"])
+        )
+    if dialect == "sqlite":
+        return (
+            sqlite_insert(RegistrationWindow)
+            .values(**values)
+            .on_conflict_do_nothing(index_elements=["window_start"])
+        )
+    if dialect in {"mysql", "mariadb"}:
+        return mysql_insert(RegistrationWindow).values(**values).prefix_with(
+            "IGNORE"
+        )
+    raise RuntimeError(f"unsupported registration window dialect: {dialect}")
+
+
+def _registration_window(
+    session: Session,
+    *,
+    window_start: datetime,
+    now: datetime,
+) -> RegistrationWindow:
+    dialect = session.get_bind().dialect.name
+    session.execute(
+        _registration_insert_statement(
+            dialect,
+            window_start=window_start,
+            now=now,
+        )
+    )
+    window = session.get(
+        RegistrationWindow,
+        window_start,
+        with_for_update=True,
+    )
+    if window is None:
+        raise RuntimeError("failed to create registration window")
+    return window
+
+
 class AuthService:
     def __init__(
-        self, settings: Settings, session_factory: sessionmaker[Session]
+        self,
+        settings: Settings,
+        session_factory: sessionmaker[Session],
+        *,
+        clock: Callable[[], datetime] | None = None,
     ) -> None:
         self.settings = settings
         self.session_factory = session_factory
+        self.clock = clock or (lambda: datetime.now(timezone.utc))
 
     def _digest(self, purpose: str, raw: str) -> str:
         return hmac.new(
@@ -75,7 +138,7 @@ class AuthService:
         if not raw_token:
             raise AuthenticationError("missing_access_token")
         token_hash = self.token_hash(raw_token)
-        now = datetime.now(timezone.utc)
+        now = self.clock()
         with self.session_factory.begin() as session:
             token = session.scalar(
                 select(AccessToken)
@@ -102,7 +165,7 @@ class AuthService:
     ) -> IssuedSession:
         if not self.settings.registration_enabled:
             raise RegistrationError("registration_disabled", 503)
-        now = datetime.now(timezone.utc)
+        now = self.clock()
         installation_hash = self.installation_hash(installation_id)
         raw_token = secrets.token_urlsafe(32)
         expires_at = now + timedelta(seconds=self.settings.access_token_ttl_seconds)
@@ -111,13 +174,11 @@ class AuthService:
             with self.session_factory.begin() as session:
                 begin_immediate_if_sqlite(session)
                 window_start = _minute_start(now)
-                window = session.get(
-                    RegistrationWindow, window_start, with_for_update=True
+                window = _registration_window(
+                    session,
+                    window_start=window_start,
+                    now=now,
                 )
-                if window is None:
-                    window = RegistrationWindow(window_start=window_start)
-                    session.add(window)
-                    session.flush()
                 if (
                     window.request_count
                     >= self.settings.registration_requests_per_minute

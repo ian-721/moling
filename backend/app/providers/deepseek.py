@@ -17,6 +17,7 @@ from app.providers.base import (
     ProviderOutcomeUnknownError,
     TokenUsage,
 )
+from app.services.usage_service import with_estimated_cost
 
 RETRIABLE_STATUSES = {429, 500, 503}
 KNOWN_STATUSES = {400, 401, 402, 422, 429, 500, 503}
@@ -132,7 +133,10 @@ class DeepSeekProvider:
         }
         response = await self._client.post("/chat/completions", json=payload)
         body = _safe_body(response)
-        usage = _usage_from_body(body)
+        usage = with_estimated_cost(
+            _usage_from_body(body),
+            deep_mode=model == self.settings.deepseek_pro_model,
+        )
         if response.status_code >= 400:
             status = response.status_code
             code = (

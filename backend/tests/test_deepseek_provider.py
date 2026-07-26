@@ -4,6 +4,7 @@ import json
 
 import httpx
 import pytest
+from pytest import approx
 
 from app.config import Settings
 from app.providers.base import (
@@ -14,6 +15,7 @@ from app.providers.base import (
     ProviderOutcomeUnknownError,
 )
 from app.providers.deepseek import DeepSeekProvider
+from app.services.usage_service import with_estimated_cost
 
 
 def settings(**overrides: object) -> Settings:
@@ -241,6 +243,17 @@ async def test_known_usage_is_accumulated_across_controlled_http_retry() -> None
     assert response.usage.input_tokens == 200
     assert response.usage.output_tokens == 40
     assert response.usage.cache_hit_tokens == 120
+    expected = with_estimated_cost(
+        response.usage.__class__(
+            input_tokens=200,
+            output_tokens=40,
+            cache_hit_tokens=120,
+        ),
+        deep_mode=False,
+    )
+    assert response.usage.estimated_cost_cny == approx(
+        expected.estimated_cost_cny
+    )
     await provider.close()
 
 
@@ -310,4 +323,77 @@ async def test_pro_503_flash_fallback_does_not_add_repair_hint() -> None:
     assert models == ["deepseek-v4-pro", "deepseek-v4-flash"]
     assert response.model == "deepseek-v4-flash"
     assert response.degraded is True
+    await provider.close()
+
+
+@pytest.mark.asyncio
+async def test_pro_usage_plus_flash_usage_keeps_per_attempt_cost() -> None:
+    models: list[str] = []
+
+    def handler(http_request: httpx.Request) -> httpx.Response:
+        body = json.loads(http_request.content)
+        models.append(body["model"])
+        if len(models) == 1:
+            return httpx.Response(
+                503,
+                json={
+                    "error": {"message": "private"},
+                    "usage": success_body(valid_content())["usage"],
+                },
+            )
+        return httpx.Response(200, json=success_body(valid_content()))
+
+    provider = DeepSeekProvider(
+        settings(), transport=httpx.MockTransport(handler)
+    )
+    response = await provider.generate_reply(request(deep_mode=True))
+    pro_attempt = with_estimated_cost(
+        response.usage.__class__(
+            input_tokens=100,
+            output_tokens=20,
+            cache_hit_tokens=60,
+        ),
+        deep_mode=True,
+    )
+    flash_attempt = with_estimated_cost(
+        response.usage.__class__(
+            input_tokens=100,
+            output_tokens=20,
+            cache_hit_tokens=60,
+        ),
+        deep_mode=False,
+    )
+    all_flash = with_estimated_cost(
+        response.usage.__class__(
+            input_tokens=200,
+            output_tokens=40,
+            cache_hit_tokens=120,
+        ),
+        deep_mode=False,
+    )
+    all_pro = with_estimated_cost(
+        response.usage.__class__(
+            input_tokens=200,
+            output_tokens=40,
+            cache_hit_tokens=120,
+        ),
+        deep_mode=True,
+    )
+
+    assert models == ["deepseek-v4-pro", "deepseek-v4-flash"]
+    assert response.model == "deepseek-v4-flash"
+    assert response.degraded is True
+    assert response.usage.input_tokens == 200
+    assert response.usage.output_tokens == 40
+    assert response.usage.cache_hit_tokens == 120
+    assert response.usage.estimated_cost_cny == approx(
+        pro_attempt.estimated_cost_cny
+        + flash_attempt.estimated_cost_cny
+    )
+    assert response.usage.estimated_cost_cny != approx(
+        all_flash.estimated_cost_cny
+    )
+    assert response.usage.estimated_cost_cny != approx(
+        all_pro.estimated_cost_cny
+    )
     await provider.close()
