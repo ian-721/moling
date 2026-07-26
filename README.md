@@ -1,61 +1,45 @@
 # 墨灵（Moling / Living Notebook）
 
-墨灵是一款 Android 平板优先的 AI 手写笔记本。用户在纸面上写，客户端优先本地识别文字，服务端生成回应，回应再以墨迹浮现在纸面上。它不是聊天软件，也不会把纸面改造成气泡、头像或消息列表。
+墨灵是一款 Android 平板优先的 AI 手写笔记本。用户在纸面上写，客户端本地识别并先保存笔迹，服务端生成回应，回应再以墨迹浮现在纸面上。它不是聊天软件，不使用气泡、头像或消息列表。
 
-## M0-A 生产基线
+## v0.8 M0-B 代码基线
 
-本仓库已建立 v0.8 后续工程所需的第一版生产边界：
+当前分支在 M0-A DeepSeek V4 基线上形成远程安装闭环：
 
-- 后端生产默认供应商为 DeepSeek，普通回应使用 `deepseek-v4-flash`，深度回应预留 `deepseek-v4-pro`；
-- 业务服务依赖 `ModelProvider` 协议，不直接绑定模型 SDK；
-- 使用 OpenAI-compatible `POST /chat/completions`、JSON Output、超时和最多一次受控重试；
-- Persona、模式路由、安全规则与输出 schema 已从 `main.py` 拆为版本化文件；
-- `assistant_name` 始终与 `user_id` 或匿名 `device_profile_id` 一起解析；
-- 生产日志只记录请求 ID、模型、耗时、Token、成本估算和错误类别，不记录笔记正文、最近上下文或完整回应；
-- Vision fallback 与图片落盘在生产配置中被强制关闭；
-- Android Debug/Release 后端地址由 BuildConfig 分离，Release 只接受 HTTPS 且禁止明文流量；
-- 本地开发可使用确定性的 fake provider，不需要真实 DeepSeek Key。
+- 匿名安装注册为 `principal_type=device`；
+- 服务端签发至少 256-bit opaque bearer token，只保存 HMAC 摘要；
+- Android 用 Android Keystore AES-256-GCM 保存 Token，密文不参与备份；
+- Reply、Profile 和 Usage 均只信任 Bearer Token，不信任正文身份或名称；
+- `assistant_name` 按 `principal_id` 存储，同名身份互不关联；
+- SQLAlchemy 2.x + Alembic，开发/测试 SQLite，生产 PostgreSQL；
+- 每 principal 分钟限流、日/月额度及全局人民币预算事务闸门；
+- `(principal_id, request_id)` 幂等、内容指纹冲突和处理租约；
+- Room 本地保存页面、完整 stroke points、turn 和 reply outbox；
+- 失败、重试、进程重启和 stale response 均不删除原笔迹；
+- v0.8 `versionCode=800` / `versionName=0.8.0`，Debug、Release APK 和 AAB 构建管线；
+- Docker、迁移启动、健康/就绪探针、部署与回滚基线。
 
-这只是 M0-A 代码基线。当前没有宣称生产后端已经部署、应用已经签名、真机已经验证或商店已经提交。
+代码基线不等于真实生产部署、永久签名或真机通过。状态必须以本轮构建、环境凭据和 `adb devices` 的实际结果为准。
 
 ## 核心链路
 
 ```text
-用户 strokes
-→ 保留在客户端并由 ML Kit 本地识别
-→ recognizedText + 当前隔离身份
-→ Moling backend ReplyService
-→ ModelProvider
-→ DeepSeek 结构化回应
+stroke 完成
+→ Room 立即持久化
+→ “回应”事务快照 stroke IDs + requestId
+→ ML Kit 本地识别
+→ Android Keystore Token
+→ HTTPS Bearer 鉴权
+→ principal profile / 配额 / 预算 / 幂等
+→ DeepSeek V4 或测试 Provider
+→ Room 先保存回应
 → InkReplyOverlay 墨迹浮现
+→ 仅吸收该请求快照的 strokes
 ```
-
-识别、网络或模型失败时，现有客户端失败分支会恢复发送状态并保留原始 strokes。Vision 仍只是明确的开发 fallback，默认关闭。
-
-## 仓库结构
-
-```text
-moling/
-├─ backend/
-│  ├─ app/
-│  │  ├─ models/
-│  │  ├─ prompts/
-│  │  ├─ providers/
-│  │  └─ services/
-│  ├─ tests/
-│  ├─ main.py
-│  └─ .env.example
-├─ moling-android/
-├─ scripts/secret_scan.py
-├─ docs/launch/
-└─ AGENTS.md
-```
-
-开发前必须完整阅读根目录 `AGENTS.md` 和 `docs/launch/`。产品品牌固定为“墨灵 / Moling”；角色显示名由每个用户自行设置。名称相同绝不代表身份、关系或记忆相同，任何未来记忆存储都只能按认证用户或匿名设备作用域读取。
 
 ## 后端本地运行
 
-推荐 Python 3.12+。
+推荐 Python 3.12+：
 
 ```powershell
 cd backend
@@ -63,100 +47,73 @@ python -m venv .venv
 .\.venv\Scripts\Activate.ps1
 python -m pip install -r requirements-dev.txt
 Copy-Item .env.example .env
+python -m alembic upgrade head
 python -m pytest -q
-uvicorn main:app --host 127.0.0.1 --port 8000
+python -m uvicorn main:app --host 127.0.0.1 --port 8000
 ```
 
-`.env.example` 默认使用 `MODEL_PROVIDER=fake`，因此测试、健康检查和本地 smoke test 不需要联网或真实 Key。
-
-健康检查：
+本地 `.env.example` 使用 SQLite + fake provider，无需真实 DeepSeek Key。
 
 ```text
-GET http://127.0.0.1:8000/healthz
-```
-
-文本回应：
-
-```json
+GET  /healthz
+GET  /readyz
+POST /api/auth/device/register
+GET  /api/profile
+PATCH /api/profile
+GET  /api/usage
 POST /api/notebook/reply
-{
-  "requestId": "request-uuid",
-  "deviceProfileId": "device-profile-uuid",
-  "assistantName": "墨灵",
-  "recognizedText": "今天先做哪一步",
-  "recognitionSource": "mlkit",
-  "recentContext": null
-}
 ```
 
-`userId` 与 `deviceProfileId` 必须且只能提供一个。M0-A 先固定这个作用域边界；真实 Access Token 校验、账号 profile store、限流和预算闸门属于下一轮 M0-B。
+除注册和健康检查外，接口要求 `Authorization: Bearer <token>`。
 
-## DeepSeek 生产配置
+完整认证、配额、幂等与恢复协议见
+`docs/launch/M0B_REMOTE_INSTALL_PROTOCOL.md`；容器部署见
+`docs/deployment/M0B_DEPLOYMENT.md`。
 
-部署时从 Secret 管理注入：
+## 生产配置
 
-```env
-MOLING_ENV=production
-MODEL_PROVIDER=deepseek
-DEEPSEEK_API_KEY=<deployment-secret>
-PROVIDER_USER_ID_SALT=<deployment-secret>
-```
+生产必须：
 
-其余非 Secret 默认值见 `backend/.env.example`。生产启动校验会拒绝：
+- `MOLING_ENV=production`
+- `MODEL_PROVIDER=deepseek`
+- PostgreSQL `DATABASE_URL`
+- Secret 管理注入 `DEEPSEEK_API_KEY`、`PROVIDER_USER_ID_SALT`、`TOKEN_HASH_PEPPER`
+- 显式配置 Token TTL、注册开关/保护、限流、日/月额度、租约和全局预算
+- HTTPS ingress
+- Vision 与图片落盘关闭
 
-- 缺少 DeepSeek Key；
-- fake provider；
-- 非 HTTPS DeepSeek base URL；
-- 非规划模型名；
-- 默认开发盐；
-- 启用 Vision fallback 或图片落盘。
+缺少任何生产控制时启动会拒绝。真实值不得进入 Git、Android、Docker image、日志或 CI 输出。
 
-DeepSeek Key、provider salt、签名密钥和私人 memory seed 不得进入 Android、Git、日志、测试快照或注释。
+## Android 构建
 
-## Android 构建配置
-
-Debug 默认使用模拟器可访问的本机地址：
-
-```text
-http://10.0.2.2:8000
-```
-
-可在本地 `gradle.properties` 或命令行覆盖：
+使用 JDK 21：
 
 ```powershell
-.\gradlew.bat :app:testDebugUnitTest :app:assembleDebug `
-  -PMOLING_DEBUG_BACKEND_URL=http://192.168.1.10:8000
+cd moling-android
+.\gradlew.bat :app:testDebugUnitTest :app:lintDebug `
+  :app:assembleDebug :app:assembleRelease :app:bundleRelease
 ```
 
-Release 默认占位 URL 为 `https://api.moling.app`。真实部署域名确定后通过构建属性注入：
-
-```powershell
-.\gradlew.bat :app:assembleRelease `
-  -PMOLING_RELEASE_BACKEND_URL=https://api.example.com
-```
-
-Release 配置阶段会拒绝 `http://`，合并后的 Manifest 将 `usesCleartextTraffic` 设为 `false`。普通设置页不提供任意后端 URL。
+Release URL 通过 `-PMOLING_RELEASE_BACKEND_URL=https://...` 注入，且必须 HTTPS。签名只读取四个 `MOLING_KEYSTORE_*` 环境变量；缺少时仍可构建 unsigned Release。完整步骤见 `docs/release/V0_8_BUILD_SIGN_INSTALL.md`。
 
 ## 验证
 
 ```powershell
 cd backend
+python -m alembic upgrade head
+python -m alembic check
 python -m pytest -q
 cd ..
 python scripts/secret_scan.py
-
-cd moling-android
-.\gradlew.bat :app:testDebugUnitTest :app:assembleDebug :app:assembleRelease
 ```
 
-GitHub Actions 会执行后端测试、源代码 Secret 扫描、Android Debug 单元测试以及 Debug/Release 构建。
+CI 执行迁移 smoke、后端测试、生产配置负向测试、Secret scan、Android Room/身份/恢复单测、lint、Debug/Release APK 与 Release AAB 构建。CI 不需要真实 DeepSeek、PostgreSQL、签名或云平台凭据。
 
-## 仍待 M0-B 完成
+## M0-C 不在本轮
 
-- Android Access Token 与服务端强制认证；
-- 按认证用户持久化的 profile store，账号切换/登出清理；
-- 限流、每日/月度额度、全局预算熔断与幂等请求存储；
-- 本地页面/strokes/reply 数据库、请求状态机和进程重启后的失败恢复；
-- 生产 HTTPS 部署与远程 smoke test；
-- 签名密钥体系、v0.8 签名 APK/AAB 和真机验证；
-- 无 GMS 华为设备的识别模型状态与替代识别路径验证。
+- 云端笔记或多设备同步；
+- Google/华为/邮箱登录；
+- 长期记忆和私人 seed 导入；
+- 支付、订阅和商店权益；
+- iOS/Web；
+- 商店正式提交。
