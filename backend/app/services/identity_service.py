@@ -8,6 +8,10 @@ from typing import Literal, Protocol
 
 DEFAULT_ASSISTANT_NAME = "墨灵"
 VALID_ID = re.compile(r"^[A-Za-z0-9._:-]+$")
+DEEPSEEK_USER_ID_MAX_LENGTH = 512
+PROVIDER_USER_ID_PATTERN = re.compile(
+    rf"^[A-Za-z0-9_-]{{1,{DEEPSEEK_USER_ID_MAX_LENGTH}}}$"
+)
 
 
 @dataclass(frozen=True)
@@ -66,4 +70,7 @@ def provider_user_id(scope: IdentityScope, salt: str) -> str:
         f"{scope.kind}:{scope.subject_id}".encode("utf-8"),
         hashlib.sha256,
     ).hexdigest()
-    return f"moling_{digest[:32]}"
+    anonymous_id = f"moling_{digest[:32]}"
+    if not PROVIDER_USER_ID_PATTERN.fullmatch(anonymous_id):
+        raise ValueError("generated provider user id violates DeepSeek constraints")
+    return anonymous_id

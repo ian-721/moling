@@ -21,3 +21,12 @@ def test_no_runtime_image_write_path() -> None:
     source = "\n".join(path.read_text(encoding="utf-8") for path in root.rglob("*.py"))
     assert "write_bytes" not in source
     assert "debug_last_request" not in source
+
+
+def test_deepseek_payload_uses_user_id_not_legacy_user() -> None:
+    root = Path(__file__).resolve().parents[1]
+    source = (root / "app" / "providers" / "deepseek.py").read_text(
+        encoding="utf-8"
+    )
+    assert '"user_id": request.provider_user_id' in source
+    assert '"user": request.provider_user_id' not in source

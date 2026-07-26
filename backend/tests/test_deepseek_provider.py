@@ -12,7 +12,7 @@ from app.providers.base import (
     ModelRequest,
     ProviderError,
 )
-from app.providers.deepseek import DeepSeekProvider
+from app.providers.deepseek import DeepSeekProvider, JSON_REPAIR_HINT
 
 
 def settings(**overrides: object) -> Settings:
@@ -48,22 +48,29 @@ def success_body(content: str | None) -> dict:
     }
 
 
+def valid_content(reply: str = "回应") -> str:
+    return json.dumps(
+        {
+            "reply": reply,
+            "mode": "judgment",
+            "safety_level": "normal",
+            "should_ask": False,
+            "memory_candidates": [],
+        }
+    )
+
+
+def user_prompt(payload: dict) -> str:
+    return payload["messages"][1]["content"]
+
+
 @pytest.mark.asyncio
-async def test_normal_json_uses_flash_and_json_mode() -> None:
+async def test_normal_json_uses_flash_and_deepseek_user_id() -> None:
     seen: list[dict] = []
 
     def handler(http_request: httpx.Request) -> httpx.Response:
         seen.append(json.loads(http_request.content))
-        content = json.dumps(
-            {
-                "reply": "回应",
-                "mode": "judgment",
-                "safety_level": "normal",
-                "should_ask": False,
-                "memory_candidates": [],
-            }
-        )
-        return httpx.Response(200, json=success_body(content))
+        return httpx.Response(200, json=success_body(valid_content()))
 
     provider = DeepSeekProvider(
         settings(), transport=httpx.MockTransport(handler)
@@ -74,7 +81,24 @@ async def test_normal_json_uses_flash_and_json_mode() -> None:
     assert response.usage.cache_hit_tokens == 60
     assert seen[0]["response_format"] == {"type": "json_object"}
     assert seen[0]["thinking"] == {"type": "disabled"}
-    assert seen[0]["user"] == "moling_abcdef"
+    assert seen[0]["user_id"] == "moling_abcdef"
+    await provider.close()
+
+
+@pytest.mark.asyncio
+async def test_payload_does_not_send_legacy_user_field() -> None:
+    seen: list[dict] = []
+
+    def handler(http_request: httpx.Request) -> httpx.Response:
+        seen.append(json.loads(http_request.content))
+        return httpx.Response(200, json=success_body(valid_content()))
+
+    provider = DeepSeekProvider(
+        settings(), transport=httpx.MockTransport(handler)
+    )
+    await provider.generate_reply(request())
+    assert "user" not in seen[0]
+    assert seen[0]["user_id"] == "moling_abcdef"
     await provider.close()
 
 
@@ -120,12 +144,14 @@ async def test_status_mapping_and_retry_count(status: int) -> None:
 
 
 @pytest.mark.asyncio
-async def test_empty_content_retries_once() -> None:
+async def test_empty_content_retry_adds_repair_hint() -> None:
     calls = 0
+    bodies: list[dict] = []
 
-    def handler(_: httpx.Request) -> httpx.Response:
+    def handler(http_request: httpx.Request) -> httpx.Response:
         nonlocal calls
         calls += 1
+        bodies.append(json.loads(http_request.content))
         return httpx.Response(200, json=success_body(""))
 
     provider = DeepSeekProvider(
@@ -134,11 +160,13 @@ async def test_empty_content_retries_once() -> None:
     with pytest.raises(EmptyContentError):
         await provider.generate_reply(request())
     assert calls == 2
+    assert JSON_REPAIR_HINT not in user_prompt(bodies[0])
+    assert JSON_REPAIR_HINT in user_prompt(bodies[1])
     await provider.close()
 
 
 @pytest.mark.asyncio
-async def test_invalid_json_retries_once() -> None:
+async def test_invalid_json_retry_adds_repair_hint() -> None:
     calls = 0
     bodies: list[dict] = []
 
@@ -154,16 +182,93 @@ async def test_invalid_json_retries_once() -> None:
     with pytest.raises(InvalidProviderJsonError):
         await provider.generate_reply(request())
     assert calls == 2
-    assert "上一次输出为空或格式无效" in bodies[1]["messages"][1]["content"]
+    assert JSON_REPAIR_HINT not in user_prompt(bodies[0])
+    assert JSON_REPAIR_HINT in user_prompt(bodies[1])
+    await provider.close()
+
+
+async def assert_http_retry_does_not_add_repair_hint(status: int) -> None:
+    bodies: list[dict] = []
+
+    def handler(http_request: httpx.Request) -> httpx.Response:
+        bodies.append(json.loads(http_request.content))
+        if len(bodies) == 1:
+            return httpx.Response(status, json={"error": {"message": "private"}})
+        return httpx.Response(200, json=success_body(valid_content()))
+
+    provider = DeepSeekProvider(
+        settings(), transport=httpx.MockTransport(handler)
+    )
+    response = await provider.generate_reply(request())
+    assert response.result.reply == "回应"
+    assert len(bodies) == 2
+    assert JSON_REPAIR_HINT not in user_prompt(bodies[1])
     await provider.close()
 
 
 @pytest.mark.asyncio
-async def test_pro_503_degrades_to_flash_once() -> None:
+async def test_429_retry_does_not_add_repair_hint() -> None:
+    await assert_http_retry_does_not_add_repair_hint(429)
+
+
+@pytest.mark.asyncio
+async def test_500_retry_does_not_add_repair_hint() -> None:
+    await assert_http_retry_does_not_add_repair_hint(500)
+
+
+@pytest.mark.asyncio
+async def test_503_retry_does_not_add_repair_hint() -> None:
+    await assert_http_retry_does_not_add_repair_hint(503)
+
+
+@pytest.mark.asyncio
+async def test_network_retry_does_not_add_repair_hint() -> None:
+    bodies: list[dict] = []
+
+    def handler(http_request: httpx.Request) -> httpx.Response:
+        bodies.append(json.loads(http_request.content))
+        if len(bodies) == 1:
+            raise httpx.ConnectError("network unavailable", request=http_request)
+        return httpx.Response(200, json=success_body(valid_content()))
+
+    provider = DeepSeekProvider(
+        settings(), transport=httpx.MockTransport(handler)
+    )
+    response = await provider.generate_reply(request())
+    assert response.result.reply == "回应"
+    assert len(bodies) == 2
+    assert JSON_REPAIR_HINT not in user_prompt(bodies[1])
+    await provider.close()
+
+
+@pytest.mark.asyncio
+async def test_timeout_retry_does_not_add_repair_hint() -> None:
+    bodies: list[dict] = []
+
+    def handler(http_request: httpx.Request) -> httpx.Response:
+        bodies.append(json.loads(http_request.content))
+        if len(bodies) == 1:
+            raise httpx.ReadTimeout("provider timeout", request=http_request)
+        return httpx.Response(200, json=success_body(valid_content()))
+
+    provider = DeepSeekProvider(
+        settings(), transport=httpx.MockTransport(handler)
+    )
+    response = await provider.generate_reply(request())
+    assert response.result.reply == "回应"
+    assert len(bodies) == 2
+    assert JSON_REPAIR_HINT not in user_prompt(bodies[1])
+    await provider.close()
+
+
+@pytest.mark.asyncio
+async def test_pro_503_flash_fallback_does_not_add_repair_hint() -> None:
     models: list[str] = []
+    bodies: list[dict] = []
 
     def handler(http_request: httpx.Request) -> httpx.Response:
         body = json.loads(http_request.content)
+        bodies.append(body)
         models.append(body["model"])
         if len(models) == 1:
             return httpx.Response(503, json={"error": {"message": "private"}})
@@ -184,4 +289,5 @@ async def test_pro_503_degrades_to_flash_once() -> None:
     assert models == ["deepseek-v4-pro", "deepseek-v4-flash"]
     assert response.model == "deepseek-v4-flash"
     assert response.degraded is True
+    assert JSON_REPAIR_HINT not in user_prompt(bodies[1])
     await provider.close()
