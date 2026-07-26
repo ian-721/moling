@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import hashlib
 import json
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
+from decimal import Decimal
 
 from sqlalchemy import select
 from sqlalchemy.orm import Session, sessionmaker
@@ -12,9 +14,14 @@ from app.config import Settings
 from app.database import begin_immediate_if_sqlite
 from app.db_models import AssistantProfile, Principal, ReplyRequest
 from app.models.reply import NotebookReplyRequest, NotebookReplyResponse
-from app.providers.base import ModelResponse, ProviderError
+from app.providers.base import (
+    ModelResponse,
+    ProviderError,
+    ProviderOutcomeUnknownError,
+    TokenUsage,
+)
 from app.services.reply_service import ReplyService
-from app.services.usage_service import UsageService
+from app.services.usage_service import UsageService, with_estimated_cost
 
 
 class RequestStateError(RuntimeError):
@@ -35,6 +42,17 @@ def _utc(value: datetime) -> datetime:
     if value.tzinfo is None:
         return value.replace(tzinfo=timezone.utc)
     return value.astimezone(timezone.utc)
+
+
+def _has_usage(usage: TokenUsage) -> bool:
+    return any(
+        (
+            usage.input_tokens,
+            usage.output_tokens,
+            usage.cache_hit_tokens,
+            usage.estimated_cost_cny,
+        )
+    )
 
 
 def request_fingerprint(request: NotebookReplyRequest) -> str:
@@ -60,28 +78,39 @@ class RequestService:
         settings: Settings,
         session_factory: sessionmaker[Session],
         reply_service: ReplyService,
+        *,
+        clock: Callable[[], datetime] | None = None,
+        before_success_commit: Callable[[], None] | None = None,
     ) -> None:
         self.settings = settings
         self.session_factory = session_factory
         self.reply_service = reply_service
-        self.usage_service = UsageService(settings)
+        self.clock = clock or (lambda: datetime.now(timezone.utc))
+        self.before_success_commit = before_success_commit
+        self.usage_service = UsageService(settings, clock=self.clock)
+
+    def _find(
+        self, session: Session, principal_id: str, request_id: str
+    ) -> ReplyRequest | None:
+        return session.scalar(
+            select(ReplyRequest)
+            .where(
+                ReplyRequest.principal_id == principal_id,
+                ReplyRequest.request_id == request_id,
+            )
+            .with_for_update()
+        )
 
     async def execute(
         self, principal: Principal, request: NotebookReplyRequest
     ) -> CoordinatedReply:
         fingerprint = request_fingerprint(request)
-        now = datetime.now(timezone.utc)
+        state_error: RequestStateError | None = None
 
         with self.session_factory.begin() as session:
             begin_immediate_if_sqlite(session)
-            row = session.scalar(
-                select(ReplyRequest)
-                .where(
-                    ReplyRequest.principal_id == principal.id,
-                    ReplyRequest.request_id == request.request_id,
-                )
-                .with_for_update()
-            )
+            now = self.clock()
+            row = self._find(session, principal.id, request.request_id)
             if row is not None:
                 if row.request_fingerprint != fingerprint:
                     raise RequestStateError("idempotency_conflict", 409)
@@ -93,39 +122,76 @@ class RequestService:
                         provider_result=None,
                         replayed=True,
                     )
-                if (
-                    row.status == "processing"
-                    and row.lease_expires_at is not None
-                    and _utc(row.lease_expires_at) > now
-                ):
-                    raise RequestStateError("request_in_progress", 409)
-                if row.status == "processing":
-                    # The previous worker died after reserving quota. Release
-                    # that abandoned reservation before acquiring a fresh lease.
-                    self.usage_service.release(session, principal.id)
+                if row.status == "outcome_unknown":
+                    raise RequestStateError("request_outcome_unknown", 409)
                 if row.status == "permanent_failed":
                     raise RequestStateError("request_permanently_failed", 409)
-                if row.attempt_count >= self.settings.request_max_attempts:
+
+                lease_live = (
+                    row.lease_expires_at is not None
+                    and _utc(row.lease_expires_at) > now
+                )
+                if row.status in {"provider_not_started", "provider_in_flight"}:
+                    if lease_live:
+                        raise RequestStateError("request_in_progress", 409)
+                    if row.status == "provider_in_flight":
+                        # The provider may have accepted or completed the call.
+                        # Without provider idempotency, retrying would risk a
+                        # duplicate real charge.
+                        self.usage_service.conservative_settle(session, row)
+                        row.status = "outcome_unknown"
+                        row.error_category = "request_outcome_unknown"
+                        row.lease_expires_at = None
+                        state_error = RequestStateError(
+                            "request_outcome_unknown", 409
+                        )
+                    else:
+                        # No provider call began, so the exact persisted
+                        # reservation can be safely released and reacquired.
+                        self.usage_service.release(session, row)
+
+                if (
+                    state_error is None
+                    and row.attempt_count >= self.settings.request_max_attempts
+                ):
                     row.status = "permanent_failed"
                     row.error_category = "attempt_limit_exceeded"
-                    raise RequestStateError("request_attempt_limit_exceeded", 409)
+                    row.lease_expires_at = None
+                    state_error = RequestStateError(
+                        "request_attempt_limit_exceeded", 409
+                    )
             else:
                 row = ReplyRequest(
                     principal_id=principal.id,
                     request_id=request.request_id,
                     request_fingerprint=fingerprint,
-                    status="pending",
+                    status="provider_not_started",
                 )
                 session.add(row)
                 session.flush()
 
-            self.usage_service.reserve(session, principal.id)
-            row.status = "processing"
-            row.attempt_count += 1
-            row.lease_expires_at = now + timedelta(
-                seconds=self.settings.request_lease_seconds
-            )
-            row.error_category = None
+            if state_error is None:
+                self.usage_service.reserve(session, row)
+                row.status = "provider_not_started"
+                row.attempt_count += 1
+                row.lease_expires_at = now + timedelta(
+                    seconds=self.settings.request_lease_seconds
+                )
+                row.provider_started_at = None
+                row.error_category = None
+
+        # State mutations above must commit before exposing their stable error.
+        if state_error is not None:
+            raise state_error
+
+        # Commit a durable provider boundary before the external side effect.
+        with self.session_factory.begin() as session:
+            begin_immediate_if_sqlite(session)
+            row = self._find(session, principal.id, request.request_id)
+            if row is None or row.status != "provider_not_started":
+                raise RequestStateError("request_state_lost", 409)
+            row.status = "provider_in_flight"
+            row.provider_started_at = self.clock()
 
         try:
             with self.session_factory() as session:
@@ -137,12 +203,20 @@ class RequestService:
                     principal=principal,
                     profile=profile,
                 )
+        except ProviderOutcomeUnknownError:
+            self._mark_outcome_unknown(principal.id, request.request_id)
+            raise RequestStateError("request_outcome_unknown", 409) from None
         except ProviderError as error:
+            known_usage = with_estimated_cost(
+                error.usage,
+                deep_mode=request.deep_mode,
+            )
             self._mark_failure(
                 principal.id,
                 request.request_id,
                 error.code,
                 retryable=error.retriable,
+                usage=known_usage,
             )
             raise
         except ValueError:
@@ -154,36 +228,28 @@ class RequestService:
             )
             raise
         except Exception:
-            self._mark_failure(
-                principal.id,
-                request.request_id,
-                "internal_generation_error",
-                retryable=True,
-            )
+            # Once provider_in_flight is durable, an unexpected interruption
+            # cannot safely be treated as definitely unstarted.
+            self._mark_outcome_unknown(principal.id, request.request_id)
             raise
 
         with self.session_factory.begin() as session:
             begin_immediate_if_sqlite(session)
-            row = session.scalar(
-                select(ReplyRequest)
-                .where(
-                    ReplyRequest.principal_id == principal.id,
-                    ReplyRequest.request_id == request.request_id,
-                )
-                .with_for_update()
-            )
-            if row is None or row.status != "processing":
+            row = self._find(session, principal.id, request.request_id)
+            if row is None or row.status != "provider_in_flight":
                 raise RequestStateError("request_state_lost", 409)
+            if self.before_success_commit is not None:
+                self.before_success_commit()
             usage = provider_result.usage
-            self.usage_service.settle(session, principal.id, usage)
+            self.usage_service.settle(session, row, usage)
             row.status = "succeeded"
             row.lease_expires_at = None
             row.provider = provider_result.provider
             row.model = provider_result.model
-            row.input_tokens = usage.input_tokens
-            row.output_tokens = usage.output_tokens
-            row.cache_tokens = usage.cache_hit_tokens
-            row.estimated_cost_cny = usage.estimated_cost_cny
+            row.input_tokens += usage.input_tokens
+            row.output_tokens += usage.output_tokens
+            row.cache_tokens += usage.cache_hit_tokens
+            row.estimated_cost_cny += Decimal(str(usage.estimated_cost_cny))
             row.response_snapshot = response.model_dump_json(by_alias=True)
             row.error_category = None
         return CoordinatedReply(
@@ -199,20 +265,37 @@ class RequestService:
         category: str,
         *,
         retryable: bool,
+        usage: TokenUsage | None = None,
     ) -> None:
         with self.session_factory.begin() as session:
             begin_immediate_if_sqlite(session)
-            row = session.scalar(
-                select(ReplyRequest)
-                .where(
-                    ReplyRequest.principal_id == principal_id,
-                    ReplyRequest.request_id == request_id,
-                )
-                .with_for_update()
-            )
-            if row is None or row.status != "processing":
+            row = self._find(session, principal_id, request_id)
+            if row is None or row.status != "provider_in_flight":
                 return
-            self.usage_service.release(session, principal_id)
+            actual_usage = usage or TokenUsage()
+            if _has_usage(actual_usage):
+                self.usage_service.settle(session, row, actual_usage)
+                row.input_tokens += actual_usage.input_tokens
+                row.output_tokens += actual_usage.output_tokens
+                row.cache_tokens += actual_usage.cache_hit_tokens
+                row.estimated_cost_cny += Decimal(
+                    str(actual_usage.estimated_cost_cny)
+                )
+            else:
+                self.usage_service.release(session, row)
             row.status = "retryable_failed" if retryable else "permanent_failed"
             row.error_category = category
+            row.lease_expires_at = None
+
+    def _mark_outcome_unknown(
+        self, principal_id: str, request_id: str
+    ) -> None:
+        with self.session_factory.begin() as session:
+            begin_immediate_if_sqlite(session)
+            row = self._find(session, principal_id, request_id)
+            if row is None or row.status != "provider_in_flight":
+                return
+            self.usage_service.conservative_settle(session, row)
+            row.status = "outcome_unknown"
+            row.error_category = "request_outcome_unknown"
             row.lease_expires_at = None

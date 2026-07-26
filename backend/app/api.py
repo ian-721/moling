@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import logging
 import time
+from collections.abc import Callable
 from contextlib import asynccontextmanager
+from datetime import datetime
 from fastapi import Depends, FastAPI, Header, HTTPException, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
@@ -68,6 +70,8 @@ def create_app(
     provider: ModelProvider | None = None,
     engine: Engine | None = None,
     initialize_schema: bool | None = None,
+    clock: Callable[[], datetime] | None = None,
+    before_success_commit: Callable[[], None] | None = None,
 ) -> FastAPI:
     active_settings = settings or Settings.from_env()
     active_provider = provider or _provider_for(active_settings)
@@ -76,9 +80,13 @@ def create_app(
     auth_service = AuthService(active_settings, session_factory)
     reply_service = ReplyService(active_settings, active_provider)
     request_service = RequestService(
-        active_settings, session_factory, reply_service
+        active_settings,
+        session_factory,
+        reply_service,
+        clock=clock,
+        before_success_commit=before_success_commit,
     )
-    usage_service = UsageService(active_settings)
+    usage_service = UsageService(active_settings, clock=clock)
     should_initialize = (
         not active_settings.is_production
         if initialize_schema is None
@@ -286,6 +294,7 @@ def create_app(
                 "request_in_progress": "该请求仍在处理中",
                 "request_permanently_failed": "该请求不能继续重试",
                 "request_attempt_limit_exceeded": "该请求已达到重试上限",
+                "request_outcome_unknown": "供应商结果不确定，该请求已停止自动重试",
             }
             raise _safe_error(
                 error.status_code,

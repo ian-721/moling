@@ -179,6 +179,18 @@ class ReplyRequest(Base):
     status: Mapped[str] = mapped_column(String(24), nullable=False)
     attempt_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     lease_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    provider_started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    reservation_day_start: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True)
+    )
+    reservation_month_start: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True)
+    )
+    budget_month_start: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True)
+    )
+    reserved_cost_cny: Mapped[Decimal | None] = mapped_column(Numeric(14, 8))
+    reservation_state: Mapped[str | None] = mapped_column(String(24))
     provider: Mapped[str | None] = mapped_column(String(32))
     model: Mapped[str | None] = mapped_column(String(64))
     input_tokens: Mapped[int] = mapped_column(Integer, nullable=False, default=0)

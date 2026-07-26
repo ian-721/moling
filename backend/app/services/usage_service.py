@@ -1,13 +1,16 @@
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from decimal import Decimal
 
+from sqlalchemy.dialects.postgresql import insert as postgresql_insert
+from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.orm import Session
 
 from app.config import Settings
-from app.db_models import GlobalBudgetWindow, Principal, UsageWindow
+from app.db_models import GlobalBudgetWindow, Principal, ReplyRequest, UsageWindow
 from app.providers.base import TokenUsage
 
 FLASH_INPUT_CNY_PER_MILLION = 1.0
@@ -42,15 +45,14 @@ def _window_start(now: datetime, kind: str) -> datetime:
 
 
 def _usage_window(
-    session: Session, principal_id: str, kind: str, now: datetime
+    session: Session, principal_id: str, kind: str, window_start: datetime
 ) -> UsageWindow:
-    start = _window_start(now, kind)
     window = (
         session.query(UsageWindow)
         .filter_by(
             principal_id=principal_id,
             window_kind=kind,
-            window_start=start,
+            window_start=window_start,
         )
         .with_for_update()
         .one_or_none()
@@ -59,53 +61,108 @@ def _usage_window(
         window = UsageWindow(
             principal_id=principal_id,
             window_kind=kind,
-            window_start=start,
+            window_start=window_start,
         )
         session.add(window)
         session.flush()
     return window
 
 
+def _existing_usage_window(
+    session: Session, principal_id: str, kind: str, window_start: datetime
+) -> UsageWindow:
+    window = (
+        session.query(UsageWindow)
+        .filter_by(
+            principal_id=principal_id,
+            window_kind=kind,
+            window_start=window_start,
+        )
+        .with_for_update()
+        .one_or_none()
+    )
+    if window is None:
+        raise RuntimeError(f"missing {kind} quota reservation window")
+    return window
+
+
+def _global_budget_window(
+    session: Session, window_start: datetime
+) -> GlobalBudgetWindow:
+    dialect = session.get_bind().dialect.name
+    values = {
+        "window_start": window_start,
+        "settled_cost_cny": Decimal("0"),
+        "reserved_cost_cny": Decimal("0"),
+    }
+    if dialect == "postgresql":
+        session.execute(
+            postgresql_insert(GlobalBudgetWindow)
+            .values(**values)
+            .on_conflict_do_nothing(index_elements=["window_start"])
+        )
+    elif dialect == "sqlite":
+        session.execute(
+            sqlite_insert(GlobalBudgetWindow)
+            .values(**values)
+            .on_conflict_do_nothing(index_elements=["window_start"])
+        )
+    else:
+        existing = session.get(GlobalBudgetWindow, window_start)
+        if existing is None:
+            session.add(GlobalBudgetWindow(**values))
+            session.flush()
+    budget = session.get(GlobalBudgetWindow, window_start, with_for_update=True)
+    if budget is None:
+        raise RuntimeError("failed to create global budget window")
+    return budget
+
+
 class UsageService:
-    def __init__(self, settings: Settings) -> None:
+    def __init__(
+        self,
+        settings: Settings,
+        *,
+        clock: Callable[[], datetime] | None = None,
+    ) -> None:
         self.settings = settings
         self.reservation = Decimal(str(settings.request_cost_reservation_cny))
+        self.clock = clock or (lambda: datetime.now(timezone.utc))
 
-    def reserve(self, session: Session, principal_id: str) -> None:
-        now = datetime.now(timezone.utc)
+    def reserve(self, session: Session, request: ReplyRequest) -> None:
+        if request.reservation_state == "reserved":
+            raise RuntimeError("request already has an active reservation")
+        now = self.clock()
+        principal_id = request.principal_id
         # Locking the principal serializes all quota reservations for this
         # identity across workers and application instances.
         principal = session.get(Principal, principal_id, with_for_update=True)
         if principal is None or principal.status != "active":
             raise UsageGateError("invalid_principal", 401)
 
-        minute = _usage_window(session, principal_id, "minute", now)
+        minute_start = _window_start(now, "minute")
+        day_start = _window_start(now, "day")
+        month_start = _window_start(now, "month")
+        minute = _usage_window(session, principal_id, "minute", minute_start)
         if minute.request_count >= self.settings.principal_requests_per_minute:
             raise UsageGateError("rate_limit_exceeded", 429)
         minute.request_count += 1
 
-        day = _usage_window(session, principal_id, "day", now)
+        day = _usage_window(session, principal_id, "day", day_start)
         if (
             day.request_count + day.reserved_requests
             >= self.settings.principal_daily_request_limit
         ):
             raise UsageGateError("daily_quota_exceeded", 403)
 
-        month = _usage_window(session, principal_id, "month", now)
+        month = _usage_window(session, principal_id, "month", month_start)
         if (
             month.request_count + month.reserved_requests
             >= self.settings.principal_monthly_request_limit
         ):
             raise UsageGateError("monthly_quota_exceeded", 403)
 
-        global_start = _window_start(now, "month")
-        budget = session.get(
-            GlobalBudgetWindow, global_start, with_for_update=True
-        )
-        if budget is None:
-            budget = GlobalBudgetWindow(window_start=global_start)
-            session.add(budget)
-            session.flush()
+        budget = _global_budget_window(session, month_start)
         if (
             budget.settled_cost_cny
             + budget.reserved_cost_cny
@@ -117,49 +174,104 @@ class UsageService:
         day.reserved_requests += 1
         month.reserved_requests += 1
         budget.reserved_cost_cny += self.reservation
+        request.reservation_day_start = day_start
+        request.reservation_month_start = month_start
+        request.budget_month_start = month_start
+        request.reserved_cost_cny = self.reservation
+        request.reservation_state = "reserved"
 
     def settle(
-        self, session: Session, principal_id: str, usage: TokenUsage
+        self, session: Session, request: ReplyRequest, usage: TokenUsage
     ) -> None:
-        now = datetime.now(timezone.utc)
+        if request.reservation_state == "settled":
+            return
+        if request.reservation_state != "reserved":
+            raise RuntimeError("request has no active reservation to settle")
+        principal_id = request.principal_id
         session.get(Principal, principal_id, with_for_update=True)
         cost = Decimal(str(usage.estimated_cost_cny))
-        for kind in ("day", "month"):
-            window = _usage_window(session, principal_id, kind, now)
-            window.reserved_requests = max(window.reserved_requests - 1, 0)
+        starts = {
+            "day": request.reservation_day_start,
+            "month": request.reservation_month_start,
+        }
+        for kind, start in starts.items():
+            if start is None:
+                raise RuntimeError(f"missing persisted {kind} reservation key")
+            window = _existing_usage_window(session, principal_id, kind, start)
+            if window.reserved_requests <= 0:
+                raise RuntimeError(f"{kind} reservation underflow")
+            window.reserved_requests -= 1
             window.request_count += 1
             window.input_tokens += usage.input_tokens
             window.output_tokens += usage.output_tokens
             window.cache_tokens += usage.cache_hit_tokens
             window.estimated_cost_cny += cost
+        if request.budget_month_start is None or request.reserved_cost_cny is None:
+            raise RuntimeError("missing persisted budget reservation key")
         budget = session.get(
-            GlobalBudgetWindow, _window_start(now, "month"), with_for_update=True
+            GlobalBudgetWindow,
+            request.budget_month_start,
+            with_for_update=True,
         )
         if budget is None:
             raise RuntimeError("missing global budget reservation")
-        budget.reserved_cost_cny = max(
-            budget.reserved_cost_cny - self.reservation, Decimal("0")
-        )
+        if budget.reserved_cost_cny < request.reserved_cost_cny:
+            raise RuntimeError("global budget reservation underflow")
+        budget.reserved_cost_cny -= request.reserved_cost_cny
         budget.settled_cost_cny += cost
+        request.reservation_state = "settled"
 
-    def release(self, session: Session, principal_id: str) -> None:
-        now = datetime.now(timezone.utc)
-        session.get(Principal, principal_id, with_for_update=True)
-        for kind in ("day", "month"):
-            window = _usage_window(session, principal_id, kind, now)
-            window.reserved_requests = max(window.reserved_requests - 1, 0)
-        budget = session.get(
-            GlobalBudgetWindow, _window_start(now, "month"), with_for_update=True
+    def conservative_settle(self, session: Session, request: ReplyRequest) -> None:
+        if request.reservation_state == "settled":
+            return
+        if request.reserved_cost_cny is None:
+            raise RuntimeError("missing conservative reservation cost")
+        self.settle(
+            session,
+            request,
+            TokenUsage(estimated_cost_cny=float(request.reserved_cost_cny)),
         )
-        if budget is not None:
-            budget.reserved_cost_cny = max(
-                budget.reserved_cost_cny - self.reservation, Decimal("0")
-            )
+
+    def release(self, session: Session, request: ReplyRequest) -> None:
+        if request.reservation_state == "released":
+            return
+        if request.reservation_state != "reserved":
+            raise RuntimeError("request has no active reservation to release")
+        principal_id = request.principal_id
+        session.get(Principal, principal_id, with_for_update=True)
+        starts = {
+            "day": request.reservation_day_start,
+            "month": request.reservation_month_start,
+        }
+        for kind, start in starts.items():
+            if start is None:
+                raise RuntimeError(f"missing persisted {kind} reservation key")
+            window = _existing_usage_window(session, principal_id, kind, start)
+            if window.reserved_requests <= 0:
+                raise RuntimeError(f"{kind} reservation underflow")
+            window.reserved_requests -= 1
+        if request.budget_month_start is None or request.reserved_cost_cny is None:
+            raise RuntimeError("missing persisted budget reservation key")
+        budget = session.get(
+            GlobalBudgetWindow,
+            request.budget_month_start,
+            with_for_update=True,
+        )
+        if budget is None:
+            raise RuntimeError("missing global budget reservation")
+        if budget.reserved_cost_cny < request.reserved_cost_cny:
+            raise RuntimeError("global budget reservation underflow")
+        budget.reserved_cost_cny -= request.reserved_cost_cny
+        request.reservation_state = "released"
 
     def snapshot(self, session: Session, principal_id: str) -> UsageSnapshot:
-        now = datetime.now(timezone.utc)
-        day = _usage_window(session, principal_id, "day", now)
-        month = _usage_window(session, principal_id, "month", now)
+        now = self.clock()
+        day = _usage_window(
+            session, principal_id, "day", _window_start(now, "day")
+        )
+        month = _usage_window(
+            session, principal_id, "month", _window_start(now, "month")
+        )
         return UsageSnapshot(
             daily_used=day.request_count,
             monthly_used=month.request_count,

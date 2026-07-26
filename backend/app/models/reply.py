@@ -47,7 +47,11 @@ class NotebookReplyRequest(BaseModel):
     model_config = ConfigDict(populate_by_name=True, extra="ignore")
 
     request_id: str = Field(
-        default_factory=lambda: str(uuid4()), alias="requestId", min_length=8, max_length=128
+        default_factory=lambda: str(uuid4()),
+        alias="requestId",
+        min_length=8,
+        max_length=128,
+        pattern=r"^[A-Za-z0-9._:-]+$",
     )
     page_id: str | None = Field(default=None, alias="pageId", max_length=128)
     recognized_text: str | None = Field(

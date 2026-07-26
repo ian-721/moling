@@ -24,6 +24,7 @@ from app.providers.base import (
     TokenUsage,
 )
 from app.services.request_service import request_fingerprint
+from app.services.usage_service import UsageService
 
 
 class CapturingProvider:
@@ -291,20 +292,196 @@ def test_expired_processing_lease_is_recovered(test_settings) -> None:
             principal_id = access.principal_id
         request = NotebookReplyRequest.model_validate(payload())
         with app.state.session_factory.begin() as session:
-            session.add(
-                ReplyRequest(
+            row = ReplyRequest(
                     principal_id=principal_id,
                     request_id=request.request_id,
                     request_fingerprint=request_fingerprint(request),
-                    status="processing",
+                    status="provider_not_started",
                     attempt_count=1,
                     lease_expires_at=datetime.now(timezone.utc)
                     - timedelta(seconds=1),
                 )
-            )
+            session.add(row)
+            session.flush()
+            UsageService(test_settings).reserve(session, row)
         assert client.post(
             "/api/notebook/reply", headers=bearer(token), json=payload()
         ).status_code == 200
+        assert len(provider.requests) == 1
+
+
+def test_provider_success_before_snapshot_failure_becomes_outcome_unknown(
+    test_settings,
+) -> None:
+    now = [datetime(2026, 7, 31, 23, 59, tzinfo=timezone.utc)]
+    provider = CapturingProvider()
+    fail_commit = [True]
+
+    def crash_before_commit() -> None:
+        if fail_commit[0]:
+            fail_commit[0] = False
+            raise RuntimeError("simulated database commit failure")
+
+    app = create_app(
+        settings=test_settings,
+        provider=provider,
+        clock=lambda: now[0],
+        before_success_commit=crash_before_commit,
+    )
+    with TestClient(app, raise_server_exceptions=False) as client:
+        token = register(client)
+        first = client.post(
+            "/api/notebook/reply", headers=bearer(token), json=payload()
+        )
+        assert first.status_code == 500
+        assert len(provider.requests) == 1
+        now[0] += timedelta(seconds=test_settings.request_lease_seconds + 1)
+        retry = client.post(
+            "/api/notebook/reply", headers=bearer(token), json=payload()
+        )
+        assert retry.status_code == 409
+        assert retry.json()["detail"]["code"] == "request_outcome_unknown"
+        assert len(provider.requests) == 1
+        with app.state.session_factory() as session:
+            row = session.scalar(select(ReplyRequest))
+            assert row is not None
+            assert row.status == "outcome_unknown"
+            assert row.reservation_state == "settled"
+
+
+def test_reservation_settles_original_windows_across_month_boundary(
+    test_settings,
+) -> None:
+    now = [datetime(2026, 7, 31, 23, 59, 59, tzinfo=timezone.utc)]
+
+    class CrossingProvider(CapturingProvider):
+        async def generate_reply(self, request: ModelRequest) -> ModelResponse:
+            result = await super().generate_reply(request)
+            now[0] = datetime(2026, 8, 1, 0, 0, 1, tzinfo=timezone.utc)
+            return result
+
+    app = create_app(
+        settings=test_settings,
+        provider=CrossingProvider(),
+        clock=lambda: now[0],
+    )
+    with TestClient(app) as client:
+        token = register(client)
+        assert client.post(
+            "/api/notebook/reply", headers=bearer(token), json=payload()
+        ).status_code == 200
+        with app.state.session_factory() as session:
+            day = session.scalar(
+                select(UsageWindow).where(
+                    UsageWindow.window_kind == "day",
+                    UsageWindow.window_start
+                    == datetime(2026, 7, 31, tzinfo=timezone.utc),
+                )
+            )
+            month = session.scalar(
+                select(UsageWindow).where(
+                    UsageWindow.window_kind == "month",
+                    UsageWindow.window_start
+                    == datetime(2026, 7, 1, tzinfo=timezone.utc),
+                )
+            )
+            budget = session.get(
+                GlobalBudgetWindow,
+                datetime(2026, 7, 1, tzinfo=timezone.utc),
+            )
+            assert day is not None and day.request_count == 1
+            assert day.reserved_requests == 0
+            assert month is not None and month.request_count == 1
+            assert month.reserved_requests == 0
+            assert budget is not None and budget.reserved_cost_cny == 0
+
+
+def test_expired_unstarted_lease_releases_original_window_before_reacquire(
+    test_settings,
+) -> None:
+    old_now = datetime(2026, 7, 31, 23, 59, tzinfo=timezone.utc)
+    now = [datetime(2026, 8, 1, 0, 1, tzinfo=timezone.utc)]
+    provider = CapturingProvider()
+    app = create_app(
+        settings=test_settings,
+        provider=provider,
+        clock=lambda: now[0],
+    )
+    with TestClient(app) as client:
+        token = register(client)
+        with app.state.session_factory() as session:
+            access = session.scalar(select(AccessToken))
+            assert access is not None
+            principal_id = access.principal_id
+        request = NotebookReplyRequest.model_validate(payload())
+        with app.state.session_factory.begin() as session:
+            row = ReplyRequest(
+                principal_id=principal_id,
+                request_id=request.request_id,
+                request_fingerprint=request_fingerprint(request),
+                status="provider_not_started",
+                attempt_count=1,
+                lease_expires_at=old_now - timedelta(seconds=1),
+            )
+            session.add(row)
+            session.flush()
+            UsageService(
+                test_settings,
+                clock=lambda: old_now,
+            ).reserve(session, row)
+
+        response = client.post(
+            "/api/notebook/reply", headers=bearer(token), json=payload()
+        )
+        assert response.status_code == 200
+        assert len(provider.requests) == 1
+        with app.state.session_factory() as session:
+            days = list(
+                session.scalars(
+                    select(UsageWindow)
+                    .where(UsageWindow.window_kind == "day")
+                    .order_by(UsageWindow.window_start)
+                )
+            )
+            assert [(item.request_count, item.reserved_requests) for item in days] == [
+                (0, 0),
+                (1, 0),
+            ]
+            budgets = list(
+                session.scalars(
+                    select(GlobalBudgetWindow).order_by(
+                        GlobalBudgetWindow.window_start
+                    )
+                )
+            )
+            assert len(budgets) == 2
+            assert all(item.reserved_cost_cny == 0 for item in budgets)
+
+
+def test_attempt_limit_failure_is_committed(test_settings) -> None:
+    settings = test_settings.__class__(
+        **{**test_settings.__dict__, "request_max_attempts": 1}
+    )
+    provider = CapturingProvider(fail_once=True)
+    app = create_app(settings=settings, provider=provider)
+    with TestClient(app) as client:
+        token = register(client)
+        assert client.post(
+            "/api/notebook/reply", headers=bearer(token), json=payload()
+        ).status_code == 502
+        limited = client.post(
+            "/api/notebook/reply", headers=bearer(token), json=payload()
+        )
+        assert limited.status_code == 409
+        assert (
+            limited.json()["detail"]["code"]
+            == "request_attempt_limit_exceeded"
+        )
+        with app.state.session_factory() as session:
+            row = session.scalar(select(ReplyRequest))
+            assert row is not None
+            assert row.status == "permanent_failed"
+            assert row.error_category == "attempt_limit_exceeded"
         assert len(provider.requests) == 1
 
 
@@ -499,3 +676,15 @@ def test_log_does_not_contain_token_body_context_or_reply(
         assert secret_context not in logs
         assert "先把问题缩小" not in logs
         assert "request-123" in logs
+
+
+def test_request_id_rejects_log_injection_characters(test_settings) -> None:
+    with TestClient(create_app(settings=test_settings)) as client:
+        token = register(client)
+        response = client.post(
+            "/api/notebook/reply",
+            headers=bearer(token),
+            json=payload(requestId='request-ok\\n"forged":true'),
+        )
+        assert response.status_code == 422
+        assert response.json()["detail"]["code"] == "invalid_request_schema"

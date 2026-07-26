@@ -11,8 +11,9 @@ from app.providers.base import (
     InvalidProviderJsonError,
     ModelRequest,
     ProviderError,
+    ProviderOutcomeUnknownError,
 )
-from app.providers.deepseek import DeepSeekProvider, JSON_REPAIR_HINT
+from app.providers.deepseek import DeepSeekProvider
 
 
 def settings(**overrides: object) -> Settings:
@@ -144,7 +145,7 @@ async def test_status_mapping_and_retry_count(status: int) -> None:
 
 
 @pytest.mark.asyncio
-async def test_empty_content_retry_adds_repair_hint() -> None:
+async def test_empty_content_does_not_issue_a_second_billable_call() -> None:
     calls = 0
     bodies: list[dict] = []
 
@@ -159,14 +160,12 @@ async def test_empty_content_retry_adds_repair_hint() -> None:
     )
     with pytest.raises(EmptyContentError):
         await provider.generate_reply(request())
-    assert calls == 2
-    assert JSON_REPAIR_HINT not in user_prompt(bodies[0])
-    assert JSON_REPAIR_HINT in user_prompt(bodies[1])
+    assert calls == 1
     await provider.close()
 
 
 @pytest.mark.asyncio
-async def test_invalid_json_retry_adds_repair_hint() -> None:
+async def test_invalid_json_does_not_issue_a_second_billable_call() -> None:
     calls = 0
     bodies: list[dict] = []
 
@@ -181,9 +180,7 @@ async def test_invalid_json_retry_adds_repair_hint() -> None:
     )
     with pytest.raises(InvalidProviderJsonError):
         await provider.generate_reply(request())
-    assert calls == 2
-    assert JSON_REPAIR_HINT not in user_prompt(bodies[0])
-    assert JSON_REPAIR_HINT in user_prompt(bodies[1])
+    assert calls == 1
     await provider.close()
 
 
@@ -202,7 +199,6 @@ async def assert_http_retry_does_not_add_repair_hint(status: int) -> None:
     response = await provider.generate_reply(request())
     assert response.result.reply == "回应"
     assert len(bodies) == 2
-    assert JSON_REPAIR_HINT not in user_prompt(bodies[1])
     await provider.close()
 
 
@@ -222,6 +218,33 @@ async def test_503_retry_does_not_add_repair_hint() -> None:
 
 
 @pytest.mark.asyncio
+async def test_known_usage_is_accumulated_across_controlled_http_retry() -> None:
+    calls = 0
+
+    def handler(_: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return httpx.Response(
+                500,
+                json={
+                    "error": {"message": "private"},
+                    "usage": success_body(valid_content())["usage"],
+                },
+            )
+        return httpx.Response(200, json=success_body(valid_content()))
+
+    provider = DeepSeekProvider(
+        settings(), transport=httpx.MockTransport(handler)
+    )
+    response = await provider.generate_reply(request())
+    assert response.usage.input_tokens == 200
+    assert response.usage.output_tokens == 40
+    assert response.usage.cache_hit_tokens == 120
+    await provider.close()
+
+
+@pytest.mark.asyncio
 async def test_network_retry_does_not_add_repair_hint() -> None:
     bodies: list[dict] = []
 
@@ -237,12 +260,11 @@ async def test_network_retry_does_not_add_repair_hint() -> None:
     response = await provider.generate_reply(request())
     assert response.result.reply == "回应"
     assert len(bodies) == 2
-    assert JSON_REPAIR_HINT not in user_prompt(bodies[1])
     await provider.close()
 
 
 @pytest.mark.asyncio
-async def test_timeout_retry_does_not_add_repair_hint() -> None:
+async def test_read_timeout_is_ambiguous_and_is_not_retried() -> None:
     bodies: list[dict] = []
 
     def handler(http_request: httpx.Request) -> httpx.Response:
@@ -254,10 +276,9 @@ async def test_timeout_retry_does_not_add_repair_hint() -> None:
     provider = DeepSeekProvider(
         settings(), transport=httpx.MockTransport(handler)
     )
-    response = await provider.generate_reply(request())
-    assert response.result.reply == "回应"
-    assert len(bodies) == 2
-    assert JSON_REPAIR_HINT not in user_prompt(bodies[1])
+    with pytest.raises(ProviderOutcomeUnknownError):
+        await provider.generate_reply(request())
+    assert len(bodies) == 1
     await provider.close()
 
 
@@ -289,5 +310,4 @@ async def test_pro_503_flash_fallback_does_not_add_repair_hint() -> None:
     assert models == ["deepseek-v4-pro", "deepseek-v4-flash"]
     assert response.model == "deepseek-v4-flash"
     assert response.degraded is True
-    assert JSON_REPAIR_HINT not in user_prompt(bodies[1])
     await provider.close()
