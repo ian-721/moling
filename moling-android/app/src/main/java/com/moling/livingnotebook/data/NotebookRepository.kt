@@ -5,6 +5,7 @@ import com.moling.livingnotebook.data.local.LocalRequestState
 import com.moling.livingnotebook.data.local.MolingDatabase
 import com.moling.livingnotebook.data.local.PageEntity
 import com.moling.livingnotebook.data.local.StrokeEntity
+import com.moling.livingnotebook.data.local.decodeIds
 import com.moling.livingnotebook.data.local.decodeStrokePoints
 import com.moling.livingnotebook.data.local.encodeStrokePoints
 import com.moling.livingnotebook.drawing.Stroke
@@ -43,7 +44,15 @@ class NotebookRepository(
 
     suspend fun restore(pageId: String): NotebookRestore {
         ensurePage(pageId)
-        dao.recoverSendingAfterRestart(clock())
+        database.withTransaction {
+            dao.sendingOutbox().forEach { outbox ->
+                val strokeIds = decodeIds(outbox.strokeIdsJson)
+                if (strokeIds.isNotEmpty()) {
+                    dao.updateStrokeState(strokeIds, "ACTIVE")
+                }
+            }
+            dao.recoverSendingAfterRestart(clock())
+        }
         val reply = dao.latestUnabsorbedSuccess(pageId)
         return NotebookRestore(
             pageId = pageId,

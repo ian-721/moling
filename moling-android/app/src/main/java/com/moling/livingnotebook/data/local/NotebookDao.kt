@@ -68,6 +68,9 @@ interface NotebookDao {
     @Query("SELECT * FROM reply_outbox WHERE requestId = :requestId")
     suspend fun outbox(requestId: String): ReplyOutboxEntity?
 
+    @Query("SELECT * FROM reply_outbox WHERE state = 'SENDING'")
+    suspend fun sendingOutbox(): List<ReplyOutboxEntity>
+
     @Query(
         "SELECT * FROM reply_outbox WHERE pageId = :pageId AND " +
             "state IN ('RECOGNIZING','READY_TO_SEND','SENDING','RETRYABLE_FAILED') " +

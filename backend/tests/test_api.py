@@ -10,7 +10,12 @@ from fastapi.testclient import TestClient
 from sqlalchemy import select
 
 from app.api import create_app
-from app.db_models import AccessToken, ReplyRequest, UsageWindow
+from app.db_models import (
+    AccessToken,
+    GlobalBudgetWindow,
+    ReplyRequest,
+    UsageWindow,
+)
 from app.models.reply import GeneratedReply, NotebookReplyRequest
 from app.providers.base import (
     ModelRequest,
@@ -353,6 +358,89 @@ def test_short_rate_daily_quota_and_global_budget(test_settings) -> None:
         )
         assert response.status_code == 503
         assert response.json()["detail"]["code"] == "global_budget_exhausted"
+
+
+def test_monthly_quota_and_provider_usage_settlement(test_settings) -> None:
+    settings = test_settings.__class__(
+        **{
+            **test_settings.__dict__,
+            "principal_monthly_request_limit": 1,
+        }
+    )
+    app = create_app(settings=settings, provider=CapturingProvider())
+    with TestClient(app) as client:
+        token = register(client)
+        first = client.post(
+            "/api/notebook/reply", headers=bearer(token), json=payload()
+        )
+        assert first.status_code == 200
+        second = client.post(
+            "/api/notebook/reply",
+            headers=bearer(token),
+            json=payload(requestId="request-two"),
+        )
+        assert second.status_code == 403
+        assert second.json()["detail"]["code"] == "monthly_quota_exceeded"
+
+        with app.state.session_factory() as session:
+            day = session.scalar(
+                select(UsageWindow).where(UsageWindow.window_kind == "day")
+            )
+            month = session.scalar(
+                select(UsageWindow).where(UsageWindow.window_kind == "month")
+            )
+            budget = session.scalar(select(GlobalBudgetWindow))
+            assert day is not None
+            assert month is not None
+            assert budget is not None
+            for window in (day, month):
+                assert window.request_count == 1
+                assert window.reserved_requests == 0
+                assert window.input_tokens == 100
+                assert window.output_tokens == 20
+                assert window.estimated_cost_cny > 0
+            assert budget.reserved_cost_cny == 0
+            assert budget.settled_cost_cny == month.estimated_cost_cny
+
+
+def test_concurrent_same_request_id_uses_one_provider_call_and_one_charge(
+    test_settings,
+) -> None:
+    provider = BlockingProvider()
+    app = create_app(settings=test_settings, provider=provider)
+    with TestClient(app) as client:
+        token = register(client)
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            first = executor.submit(
+                client.post,
+                "/api/notebook/reply",
+                headers=bearer(token),
+                json=payload(),
+            )
+            assert provider.entered.wait(3)
+            duplicate = client.post(
+                "/api/notebook/reply",
+                headers=bearer(token),
+                json=payload(),
+            )
+            provider.release.set()
+            assert first.result(timeout=5).status_code == 200
+
+        assert duplicate.status_code == 409
+        assert duplicate.json()["detail"]["code"] == "request_in_progress"
+        assert len(provider.requests) == 1
+        replay = client.post(
+            "/api/notebook/reply", headers=bearer(token), json=payload()
+        )
+        assert replay.status_code == 200
+        assert len(provider.requests) == 1
+        with app.state.session_factory() as session:
+            day = session.scalar(
+                select(UsageWindow).where(UsageWindow.window_kind == "day")
+            )
+            assert day is not None
+            assert day.request_count == 1
+            assert day.reserved_requests == 0
 
 
 def test_concurrent_daily_reservation_is_atomic(test_settings) -> None:

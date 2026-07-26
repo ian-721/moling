@@ -108,6 +108,24 @@ class LocalPersistenceTest {
     }
 
     @Test
+    fun processRestartReturnsInterruptedStrokesToEditableState() = runBlocking {
+        val interrupted = stroke("interrupted")
+        notebook.persistStroke("page", interrupted)
+        outbox.createSnapshot("restart-request", "page", listOf(interrupted.id))
+        outbox.markRecognized("restart-request", "内容", "mlkit")
+        outbox.markSending("restart-request")
+
+        notebook.restore("page")
+
+        assertEquals("interrupted", notebook.undo("page"))
+        assertTrue(notebook.restore("page").strokes.isEmpty())
+        assertEquals(
+            LocalRequestState.RETRYABLE_FAILED,
+            outbox.pending("page")?.state
+        )
+    }
+
+    @Test
     fun undoAndClearAreBackedByDatabase() = runBlocking {
         notebook.persistStroke("page", stroke("one"))
         notebook.persistStroke("page", stroke("two"))
