@@ -38,3 +38,28 @@ def test_production_rejects_empty_provider_user_salt() -> None:
             deepseek_api_key="test-placeholder",
             provider_user_id_salt="",
         ).validate()
+
+
+def test_production_rejects_implicit_limits_and_budget() -> None:
+    with pytest.raises(ConfigurationError, match="explicit database"):
+        Settings(
+            environment="production",
+            model_provider="deepseek",
+            deepseek_api_key="test-placeholder",
+            provider_user_id_salt="deployment-secret-placeholder",
+            token_hash_pepper="deployment-token-pepper-placeholder",
+            database_url="postgresql+psycopg://example.invalid/moling",
+            production_limits_explicit=False,
+        ).validate()
+
+
+def test_production_requires_postgresql() -> None:
+    with pytest.raises(ConfigurationError, match="PostgreSQL"):
+        Settings(
+            environment="production",
+            model_provider="deepseek",
+            deepseek_api_key="test-placeholder",
+            provider_user_id_salt="deployment-secret-placeholder",
+            token_hash_pepper="deployment-token-pepper-placeholder",
+            database_url="sqlite:///unsafe-production.db",
+        ).validate()

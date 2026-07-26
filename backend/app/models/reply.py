@@ -44,19 +44,16 @@ class GeneratedReply(BaseModel):
 
 
 class NotebookReplyRequest(BaseModel):
-    model_config = ConfigDict(populate_by_name=True)
+    model_config = ConfigDict(populate_by_name=True, extra="ignore")
 
     request_id: str = Field(
-        default_factory=lambda: str(uuid4()), alias="requestId", min_length=8, max_length=128
+        default_factory=lambda: str(uuid4()),
+        alias="requestId",
+        min_length=8,
+        max_length=128,
+        pattern=r"^[A-Za-z0-9._:-]+$",
     )
     page_id: str | None = Field(default=None, alias="pageId", max_length=128)
-    user_id: str | None = Field(default=None, alias="userId", min_length=3, max_length=128)
-    device_profile_id: str | None = Field(
-        default=None, alias="deviceProfileId", min_length=8, max_length=128
-    )
-    assistant_name: str | None = Field(
-        default=None, alias="assistantName", max_length=32
-    )
     recognized_text: str | None = Field(
         default=None, alias="recognizedText", max_length=3000
     )
@@ -69,11 +66,6 @@ class NotebookReplyRequest(BaseModel):
     image_base64: str | None = Field(default=None, alias="imageBase64")
     deep_mode: bool = Field(default=False, alias="deepMode")
 
-    @model_validator(mode="after")
-    def require_scoped_identity(self) -> "NotebookReplyRequest":
-        if bool(self.user_id) == bool(self.device_profile_id):
-            raise ValueError("provide exactly one of userId or deviceProfileId")
-        return self
 
 
 class NotebookReplyResponse(BaseModel):

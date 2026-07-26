@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 from app.config import Settings
+from app.db_models import AssistantProfile as DatabaseAssistantProfile
+from app.db_models import Principal
 from app.models.reply import NotebookReplyRequest, NotebookReplyResponse
 from app.providers.base import ModelProvider, ModelRequest, ModelResponse
 from app.services.identity_service import (
-    build_scope,
+    AssistantProfile,
+    IdentityScope,
     provider_user_id,
-    resolve_request_profile,
 )
 from app.services.prompt_service import build_prompt
 from app.services.usage_service import with_estimated_cost
@@ -17,15 +19,26 @@ class ReplyService:
         self.settings = settings
         self.provider = provider
 
-    async def reply(self, request: NotebookReplyRequest) -> tuple[NotebookReplyResponse, ModelResponse]:
+    async def reply(
+        self,
+        request: NotebookReplyRequest,
+        *,
+        principal: Principal,
+        profile: DatabaseAssistantProfile,
+    ) -> tuple[NotebookReplyResponse, ModelResponse]:
         recognized_text = (request.recognized_text or "").strip()
         if not recognized_text or recognized_text.upper() == "UNCLEAR":
             raise ValueError("recognizedText is required for the production text path")
 
-        scope = build_scope(request.user_id, request.device_profile_id)
-        profile = resolve_request_profile(scope, request.assistant_name)
+        scope = IdentityScope(
+            "user" if principal.principal_type == "user" else "device",
+            principal.id,
+        )
         prompt = build_prompt(
-            profile=profile,
+            profile=AssistantProfile(
+                scope=scope,
+                assistant_name=profile.assistant_name,
+            ),
             recognized_text=recognized_text,
             recent_context=request.recent_context,
         )

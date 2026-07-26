@@ -15,6 +15,14 @@ def _as_bool(value: str | None, default: bool = False) -> bool:
     return value.strip().lower() in {"1", "true", "yes", "on"}
 
 
+def _as_int(name: str, default: int) -> int:
+    return int(os.getenv(name, str(default)))
+
+
+def _as_float(name: str, default: float) -> float:
+    return float(os.getenv(name, str(default)))
+
+
 @dataclass(frozen=True)
 class Settings:
     environment: str = "development"
@@ -31,6 +39,20 @@ class Settings:
     vision_fallback_enabled: bool = False
     debug_image_save_enabled: bool = False
     log_level: str = "INFO"
+    database_url: str = "sqlite:///./moling.db"
+    token_hash_pepper: str = "development-only-token-pepper"
+    access_token_ttl_seconds: int = 2_592_000
+    registration_enabled: bool = True
+    registration_requests_per_minute: int = 30
+    registration_max_principals: int = 10_000
+    principal_requests_per_minute: int = 10
+    principal_daily_request_limit: int = 50
+    principal_monthly_request_limit: int = 500
+    global_monthly_budget_cny: float = 300.0
+    request_lease_seconds: int = 90
+    request_max_attempts: int = 3
+    request_cost_reservation_cny: float = 0.05
+    production_limits_explicit: bool = True
 
     @property
     def is_production(self) -> bool:
@@ -38,6 +60,21 @@ class Settings:
 
     @classmethod
     def from_env(cls) -> "Settings":
+        production_limit_names = {
+            "DATABASE_URL",
+            "TOKEN_HASH_PEPPER",
+            "ACCESS_TOKEN_TTL_SECONDS",
+            "REGISTRATION_ENABLED",
+            "REGISTRATION_REQUESTS_PER_MINUTE",
+            "REGISTRATION_MAX_PRINCIPALS",
+            "PRINCIPAL_REQUESTS_PER_MINUTE",
+            "PRINCIPAL_DAILY_REQUEST_LIMIT",
+            "PRINCIPAL_MONTHLY_REQUEST_LIMIT",
+            "GLOBAL_MONTHLY_BUDGET_CNY",
+            "REQUEST_LEASE_SECONDS",
+            "REQUEST_MAX_ATTEMPTS",
+            "REQUEST_COST_RESERVATION_CNY",
+        }
         settings = cls(
             environment=os.getenv("MOLING_ENV", "development"),
             model_provider=os.getenv("MODEL_PROVIDER", "fake"),
@@ -67,6 +104,40 @@ class Settings:
                 os.getenv("DEBUG_IMAGE_SAVE_ENABLED"), False
             ),
             log_level=os.getenv("LOG_LEVEL", "INFO"),
+            database_url=os.getenv("DATABASE_URL", "sqlite:///./moling.db"),
+            token_hash_pepper=os.getenv(
+                "TOKEN_HASH_PEPPER", "development-only-token-pepper"
+            ),
+            access_token_ttl_seconds=_as_int("ACCESS_TOKEN_TTL_SECONDS", 2_592_000),
+            registration_enabled=_as_bool(
+                os.getenv("REGISTRATION_ENABLED"), True
+            ),
+            registration_requests_per_minute=_as_int(
+                "REGISTRATION_REQUESTS_PER_MINUTE", 30
+            ),
+            registration_max_principals=_as_int(
+                "REGISTRATION_MAX_PRINCIPALS", 10_000
+            ),
+            principal_requests_per_minute=_as_int(
+                "PRINCIPAL_REQUESTS_PER_MINUTE", 10
+            ),
+            principal_daily_request_limit=_as_int(
+                "PRINCIPAL_DAILY_REQUEST_LIMIT", 50
+            ),
+            principal_monthly_request_limit=_as_int(
+                "PRINCIPAL_MONTHLY_REQUEST_LIMIT", 500
+            ),
+            global_monthly_budget_cny=_as_float(
+                "GLOBAL_MONTHLY_BUDGET_CNY", 300.0
+            ),
+            request_lease_seconds=_as_int("REQUEST_LEASE_SECONDS", 90),
+            request_max_attempts=_as_int("REQUEST_MAX_ATTEMPTS", 3),
+            request_cost_reservation_cny=_as_float(
+                "REQUEST_COST_RESERVATION_CNY", 0.05
+            ),
+            production_limits_explicit=all(
+                os.getenv(name) is not None for name in production_limit_names
+            ),
         )
         settings.validate()
         return settings
@@ -78,6 +149,25 @@ class Settings:
             raise ConfigurationError("DEEPSEEK_RETRY_COUNT must be 0 or 1")
         if self.default_max_tokens <= 0 or self.deep_max_tokens <= 0:
             raise ConfigurationError("DeepSeek max token limits must be positive")
+        if not self.database_url:
+            raise ConfigurationError("DATABASE_URL must not be empty")
+        positive_limits = {
+            "ACCESS_TOKEN_TTL_SECONDS": self.access_token_ttl_seconds,
+            "REGISTRATION_REQUESTS_PER_MINUTE": self.registration_requests_per_minute,
+            "REGISTRATION_MAX_PRINCIPALS": self.registration_max_principals,
+            "PRINCIPAL_REQUESTS_PER_MINUTE": self.principal_requests_per_minute,
+            "PRINCIPAL_DAILY_REQUEST_LIMIT": self.principal_daily_request_limit,
+            "PRINCIPAL_MONTHLY_REQUEST_LIMIT": self.principal_monthly_request_limit,
+            "GLOBAL_MONTHLY_BUDGET_CNY": self.global_monthly_budget_cny,
+            "REQUEST_LEASE_SECONDS": self.request_lease_seconds,
+            "REQUEST_MAX_ATTEMPTS": self.request_max_attempts,
+            "REQUEST_COST_RESERVATION_CNY": self.request_cost_reservation_cny,
+        }
+        invalid = [name for name, value in positive_limits.items() if value <= 0]
+        if invalid:
+            raise ConfigurationError(
+                f"Quota and token settings must be positive: {', '.join(invalid)}"
+            )
         if self.deepseek_flash_model != "deepseek-v4-flash":
             raise ConfigurationError(
                 "DEEPSEEK_FLASH_MODEL must be deepseek-v4-flash for M0-A"
@@ -92,6 +182,11 @@ class Settings:
             raise ConfigurationError("DEEPSEEK_BASE_URL must be an HTTPS URL")
 
         if self.is_production:
+            if not self.production_limits_explicit:
+                raise ConfigurationError(
+                    "Production requires explicit database, token TTL, registration, "
+                    "rate, quota, lease, and budget configuration"
+                )
             if self.model_provider != "deepseek":
                 raise ConfigurationError(
                     "Production requires MODEL_PROVIDER=deepseek"
@@ -110,4 +205,18 @@ class Settings:
             if self.vision_fallback_enabled or self.debug_image_save_enabled:
                 raise ConfigurationError(
                     "Production must disable Vision fallback and image persistence"
+                )
+            if (
+                not self.token_hash_pepper
+                or self.token_hash_pepper == "development-only-token-pepper"
+            ):
+                raise ConfigurationError(
+                    "Production requires TOKEN_HASH_PEPPER from deployment secrets"
+                )
+            if not (
+                self.database_url.startswith("postgresql://")
+                or self.database_url.startswith("postgresql+psycopg://")
+            ):
+                raise ConfigurationError(
+                    "Production DATABASE_URL must use PostgreSQL"
                 )

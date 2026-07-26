@@ -39,21 +39,28 @@ class ProviderError(RuntimeError):
         *,
         provider_status: int | None = None,
         retriable: bool = False,
+        usage: TokenUsage | None = None,
     ) -> None:
         super().__init__(code)
         self.code = code
         self.provider_status = provider_status
         self.retriable = retriable
+        self.usage = usage or TokenUsage()
 
 
 class EmptyContentError(ProviderError):
-    def __init__(self) -> None:
-        super().__init__("empty_content", retriable=True)
+    def __init__(self, usage: TokenUsage | None = None) -> None:
+        super().__init__("empty_content", retriable=False, usage=usage)
 
 
 class InvalidProviderJsonError(ProviderError):
-    def __init__(self) -> None:
-        super().__init__("invalid_provider_json", retriable=True)
+    def __init__(self, usage: TokenUsage | None = None) -> None:
+        super().__init__("invalid_provider_json", retriable=False, usage=usage)
+
+
+class ProviderOutcomeUnknownError(ProviderError):
+    def __init__(self, code: str = "provider_outcome_unknown") -> None:
+        super().__init__(code, retriable=False)
 
 
 class ModelProvider(Protocol):

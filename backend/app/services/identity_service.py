@@ -53,6 +53,19 @@ def normalize_assistant_name(value: str | None) -> str:
     return normalized
 
 
+def validate_assistant_name(value: str | None) -> str:
+    if value is None:
+        raise ValueError("assistant_name is required")
+    normalized = " ".join(value.strip().split())
+    if not normalized:
+        raise ValueError("assistant_name must not be blank")
+    if len(normalized) > 16:
+        raise ValueError("assistant_name is too long")
+    if any(ord(char) < 32 or ord(char) == 127 for char in normalized):
+        raise ValueError("assistant_name contains control characters")
+    return normalized
+
+
 def resolve_request_profile(
     scope: IdentityScope, assistant_name: str | None
 ) -> AssistantProfile:
