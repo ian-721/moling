@@ -28,13 +28,14 @@ class BackendConfigTest {
 
     @Test
     fun networkErrorsMapToSafeMessages() {
+        val client = NotebookApiClient("https://api.moling.app")
         assertEquals(
-            "\u56de\u5e94\u592a\u9891\u7e41\uff0c\u7a0d\u540e\u518d\u8bd5",
-            NotebookApiClient.errorMessage(429, "")
+            "\u56de\u5e94\u592a\u9891\u7e41\uff0c\u8bf7\u7a0d\u540e\u518d\u8bd5",
+            client.parseFailure(429, "").reason
         )
         assertEquals(
             "\u6a21\u578b\u670d\u52a1\u6682\u65f6\u4e0d\u53ef\u7528",
-            NotebookApiClient.errorMessage(503, "")
+            client.parseFailure(503, "").reason
         )
     }
 }

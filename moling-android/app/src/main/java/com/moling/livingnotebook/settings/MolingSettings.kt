@@ -8,7 +8,7 @@ data class MolingSettings(
     val paperBackground: PaperBackgroundOption = PaperBackgroundOption.Parchment,
     val showDebugInfo: Boolean = true,
     val assistantName: String = DEFAULT_ASSISTANT_NAME,
-    val deviceProfileId: String? = null
+    val installationId: String? = null
 )
 
 const val DEFAULT_ASSISTANT_NAME = "\u58a8\u7075"

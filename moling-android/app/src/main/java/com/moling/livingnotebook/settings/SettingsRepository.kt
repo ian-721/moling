@@ -40,7 +40,7 @@ class SettingsRepository(context: Context) {
                 ),
                 showDebugInfo = preferences[Keys.ShowDebugInfo] ?: true,
                 assistantName = normalizeAssistantName(preferences[Keys.AssistantName]),
-                deviceProfileId = preferences[Keys.DeviceProfileId]
+                installationId = preferences[Keys.InstallationId]
             )
         }
 
@@ -78,16 +78,30 @@ class SettingsRepository(context: Context) {
         }
     }
 
-    suspend fun getOrCreateDeviceProfileId(): String {
+    suspend fun getOrCreateInstallationId(): String {
         var resolved = ""
         dataStore.edit { preferences ->
-            resolved = preferences[Keys.DeviceProfileId].orEmpty()
+            resolved = preferences[Keys.InstallationId].orEmpty()
             if (resolved.isBlank()) {
                 resolved = UUID.randomUUID().toString()
-                preferences[Keys.DeviceProfileId] = resolved
+                preferences[Keys.InstallationId] = resolved
             }
         }
         return resolved
+    }
+
+    suspend fun rotateInstallationId(): String {
+        val installationId = UUID.randomUUID().toString()
+        dataStore.edit { preferences ->
+            preferences[Keys.InstallationId] = installationId
+        }
+        return installationId
+    }
+
+    suspend fun clearIdentityProfile() {
+        dataStore.edit { preferences ->
+            preferences.remove(Keys.AssistantName)
+        }
     }
 
     private object Keys {
@@ -96,6 +110,6 @@ class SettingsRepository(context: Context) {
         val PaperBackground = stringPreferencesKey("paper_background")
         val ShowDebugInfo = booleanPreferencesKey("show_debug_info")
         val AssistantName = stringPreferencesKey("assistant_name")
-        val DeviceProfileId = stringPreferencesKey("device_profile_id")
+        val InstallationId = stringPreferencesKey("installation_id")
     }
 }

@@ -6,102 +6,188 @@ import org.json.JSONObject
 import java.io.OutputStreamWriter
 import java.net.HttpURLConnection
 import java.net.URL
-import java.util.UUID
 
-sealed class NotebookReplyResult {
-    data class Success(
-        val recognizedText: String,
-        val aiReply: String,
-        val responseMode: String,
-        val recognitionSource: String
-    ) : NotebookReplyResult()
+data class RemoteProfile(
+    val assistantName: String,
+    val updatedAt: String
+)
 
-    data class Failure(val reason: String) : NotebookReplyResult()
+data class RegisteredSession(
+    val accessToken: String,
+    val expiresAt: String,
+    val profile: RemoteProfile
+)
+
+data class NotebookReply(
+    val requestId: String,
+    val recognizedText: String,
+    val aiReply: String,
+    val responseMode: String,
+    val recognitionSource: String,
+    val safetyLevel: String
+)
+
+sealed class RemoteResult<out T> {
+    data class Success<T>(val value: T) : RemoteResult<T>()
+    data class Failure(
+        val statusCode: Int?,
+        val code: String,
+        val reason: String,
+        val retryable: Boolean
+    ) : RemoteResult<Nothing>() {
+        val unauthorized: Boolean get() = statusCode == 401
+    }
 }
 
-/**
- * 只用 HttpURLConnection + org.json（Android SDK 自带），不引入 OkHttp/Retrofit 等网络依赖。
- * App 全程只知道 baseUrl，不接触任何 OpenAI API Key。
- *
- * v0.5 主路径：客户端用 ML Kit 识别出 recognizedText 后直接发文本；
- * imageBase64 仅在明确开启 Vision fallback 时才携带。
- */
-object NotebookApiClient {
+open class NotebookApiClient(private val baseUrl: String) {
+    private val connectTimeoutMs = 15_000
+    private val readTimeoutMs = 45_000
 
-    private const val CONNECT_TIMEOUT_MS = 15_000
-    private const val READ_TIMEOUT_MS = 30_000
+    open suspend fun registerDevice(
+        installationId: String,
+        rotationToken: String? = null
+    ): RemoteResult<RegisteredSession> = request(
+        method = "POST",
+        path = "/api/auth/device/register",
+        token = rotationToken,
+        body = JSONObject().put("installationId", installationId)
+    ) { json ->
+        val profile = json.getJSONObject("profile")
+        RegisteredSession(
+            accessToken = json.getString("accessToken"),
+            expiresAt = json.getString("expiresAt"),
+            profile = RemoteProfile(
+                assistantName = profile.getString("assistantName"),
+                updatedAt = profile.getString("updatedAt")
+            )
+        )
+    }
 
-    suspend fun requestNotebookReply(
-        baseUrl: String,
+    open suspend fun getProfile(token: String): RemoteResult<RemoteProfile> = request(
+        method = "GET",
+        path = "/api/profile",
+        token = token
+    ) { json ->
+        RemoteProfile(
+            assistantName = json.getString("assistantName"),
+            updatedAt = json.getString("updatedAt")
+        )
+    }
+
+    open suspend fun patchProfile(
+        token: String,
+        assistantName: String
+    ): RemoteResult<RemoteProfile> = request(
+        method = "PATCH",
+        path = "/api/profile",
+        token = token,
+        body = JSONObject().put("assistantName", assistantName)
+    ) { json ->
+        RemoteProfile(
+            assistantName = json.getString("assistantName"),
+            updatedAt = json.getString("updatedAt")
+        )
+    }
+
+    open suspend fun requestNotebookReply(
+        token: String,
+        requestId: String,
         recognizedText: String? = null,
         recognitionSource: String? = null,
         recentContext: String? = null,
         imageBase64: String? = null,
-        pageId: String? = null,
-        deviceProfileId: String,
-        assistantName: String
-    ): NotebookReplyResult = withContext(Dispatchers.IO) {
+        pageId: String? = null
+    ): RemoteResult<NotebookReply> = request(
+        method = "POST",
+        path = "/api/notebook/reply",
+        token = token,
+        body = JSONObject().apply {
+            put("requestId", requestId)
+            put("pageId", pageId ?: JSONObject.NULL)
+            put("recognizedText", recognizedText ?: JSONObject.NULL)
+            put("recognitionSource", recognitionSource ?: JSONObject.NULL)
+            put("recentContext", recentContext ?: JSONObject.NULL)
+            put("imageBase64", imageBase64 ?: JSONObject.NULL)
+        }
+    ) { json ->
+        NotebookReply(
+            requestId = json.getString("requestId"),
+            recognizedText = json.optString("recognizedText", ""),
+            aiReply = json.optString("aiReply", ""),
+            responseMode = json.optString("responseMode", ""),
+            recognitionSource = json.optString("recognitionSource", ""),
+            safetyLevel = json.optString("safetyLevel", "normal")
+        )
+    }
+
+    private suspend fun <T> request(
+        method: String,
+        path: String,
+        token: String? = null,
+        body: JSONObject? = null,
+        parse: (JSONObject) -> T
+    ): RemoteResult<T> = withContext(Dispatchers.IO) {
         var connection: HttpURLConnection? = null
         try {
-            val url = URL("$baseUrl/api/notebook/reply")
-            connection = (url.openConnection() as HttpURLConnection).apply {
-                requestMethod = "POST"
-                doOutput = true
-                connectTimeout = CONNECT_TIMEOUT_MS
-                readTimeout = READ_TIMEOUT_MS
-                setRequestProperty("Content-Type", "application/json; charset=utf-8")
+            connection = (URL("$baseUrl$path").openConnection() as HttpURLConnection).apply {
+                requestMethod = method
+                connectTimeout = connectTimeoutMs
+                readTimeout = readTimeoutMs
+                setRequestProperty("Accept", "application/json")
+                if (token != null) setRequestProperty("Authorization", "Bearer $token")
+                if (body != null) {
+                    doOutput = true
+                    setRequestProperty("Content-Type", "application/json; charset=utf-8")
+                }
             }
-
-            val requestBody = JSONObject().apply {
-                put("requestId", UUID.randomUUID().toString())
-                put("pageId", pageId ?: JSONObject.NULL)
-                put("deviceProfileId", deviceProfileId)
-                put("assistantName", assistantName)
-                put("recognizedText", recognizedText ?: JSONObject.NULL)
-                put("recognitionSource", recognitionSource ?: JSONObject.NULL)
-                put("recentContext", recentContext ?: JSONObject.NULL)
-                put("imageBase64", imageBase64 ?: JSONObject.NULL)
+            if (body != null) {
+                OutputStreamWriter(connection.outputStream, Charsets.UTF_8).use { writer ->
+                    writer.write(body.toString())
+                }
             }
-
-            OutputStreamWriter(connection.outputStream, Charsets.UTF_8).use { writer ->
-                writer.write(requestBody.toString())
+            val status = connection.responseCode
+            val stream = if (status in 200..299) {
+                connection.inputStream
+            } else {
+                connection.errorStream
             }
-
-            val responseCode = connection.responseCode
-            val stream = if (responseCode in 200..299) connection.inputStream else connection.errorStream
-            val responseText = stream?.bufferedReader(Charsets.UTF_8)?.use { it.readText() } ?: ""
-
-            if (responseCode !in 200..299) {
-                return@withContext NotebookReplyResult.Failure(errorMessage(responseCode, responseText))
+            val responseText =
+                stream?.bufferedReader(Charsets.UTF_8)?.use { it.readText() }.orEmpty()
+            if (status !in 200..299) {
+                return@withContext parseFailure(status, responseText)
             }
-
-            val json = JSONObject(responseText)
-            NotebookReplyResult.Success(
-                recognizedText = json.optString("recognizedText", ""),
-                aiReply = json.optString("aiReply", ""),
-                responseMode = json.optString("responseMode", ""),
-                recognitionSource = json.optString("recognitionSource", "")
+            RemoteResult.Success(parse(JSONObject(responseText)))
+        } catch (_: Exception) {
+            RemoteResult.Failure(
+                statusCode = null,
+                code = "network_error",
+                reason = "网络请求失败，笔迹已保留",
+                retryable = true
             )
-        } catch (e: Exception) {
-            NotebookReplyResult.Failure(e.message ?: "网络请求失败")
         } finally {
             connection?.disconnect()
         }
     }
 
-    internal fun errorMessage(responseCode: Int, responseText: String): String {
+    internal fun parseFailure(status: Int, responseText: String): RemoteResult.Failure {
         val detail = runCatching {
-            val raw = JSONObject(responseText).opt("detail")
-            when (raw) {
-                is JSONObject -> raw.optString("message")
-                is String -> raw
-                else -> null
-            }
+            JSONObject(responseText).optJSONObject("detail")
         }.getOrNull()
-        return detail?.takeIf { it.isNotBlank() } ?: when (responseCode) {
-            429 -> "\u56de\u5e94\u592a\u9891\u7e41\uff0c\u7a0d\u540e\u518d\u8bd5"
-            502, 503 -> "\u6a21\u578b\u670d\u52a1\u6682\u65f6\u4e0d\u53ef\u7528"
-            else -> "\u540e\u7aef\u8fd4\u56de\u9519\u8bef\uff08$responseCode\uff09"
-        }
+        val code = detail?.optString("code")?.takeIf { it.isNotBlank() }
+            ?: "http_$status"
+        val message = detail?.optString("message")?.takeIf { it.isNotBlank() }
+            ?: when (status) {
+                401 -> "会话已失效"
+                429 -> "回应太频繁，请稍后再试"
+                502, 503 -> "模型服务暂时不可用"
+                else -> "后端返回错误（$status）"
+            }
+        return RemoteResult.Failure(
+            statusCode = status,
+            code = code,
+            reason = message,
+            retryable = status == 401 || status == 408 || status == 409 ||
+                status == 429 || status >= 500
+        )
     }
 }
