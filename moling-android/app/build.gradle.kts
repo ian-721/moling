@@ -3,6 +3,13 @@ plugins {
     alias(libs.plugins.kotlin.compose)
 }
 
+val debugBackendUrl = providers.gradleProperty("MOLING_DEBUG_BACKEND_URL")
+    .orElse("http://10.0.2.2:8000")
+val releaseBackendUrl = providers.gradleProperty("MOLING_RELEASE_BACKEND_URL")
+    .orElse("https://api.moling.app")
+
+fun quoted(value: String): String = "\"${value.replace("\\", "\\\\").replace("\"", "\\\"")}\""
+
 android {
     namespace = "com.moling.livingnotebook"
     compileSdk {
@@ -22,7 +29,19 @@ android {
     }
 
     buildTypes {
+        debug {
+            buildConfigField("String", "BACKEND_BASE_URL", quoted(debugBackendUrl.get()))
+            buildConfigField("Boolean", "ENABLE_VISION_FALLBACK", "false")
+            manifestPlaceholders["usesCleartextTraffic"] = "true"
+        }
         release {
+            val productionUrl = releaseBackendUrl.get()
+            require(productionUrl.startsWith("https://")) {
+                "MOLING_RELEASE_BACKEND_URL must use HTTPS"
+            }
+            buildConfigField("String", "BACKEND_BASE_URL", quoted(productionUrl))
+            buildConfigField("Boolean", "ENABLE_VISION_FALLBACK", "false")
+            manifestPlaceholders["usesCleartextTraffic"] = "false"
             optimization {
                 enable = false
             }
@@ -34,6 +53,7 @@ android {
     }
     buildFeatures {
         compose = true
+        buildConfig = true
     }
 }
 

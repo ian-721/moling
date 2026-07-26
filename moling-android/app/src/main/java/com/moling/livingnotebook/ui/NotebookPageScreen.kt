@@ -91,6 +91,7 @@ fun NotebookPageScreen(modifier: Modifier = Modifier) {
     fun respond() {
         coroutineScope.launch {
             viewModel.beginRespond()
+            val deviceProfileId = settingsRepository.getOrCreateDeviceProfileId()
 
             when (val recognition = InkRecognitionService.recognize(viewModel.strokes.toList())) {
                 is InkRecognitionResult.Success -> {
@@ -100,7 +101,9 @@ fun NotebookPageScreen(modifier: Modifier = Modifier) {
                             baseUrl = BackendConfig.BASE_URL,
                             recognizedText = recognition.text,
                             recognitionSource = "mlkit",
-                            recentContext = viewModel.buildRecentContext()
+                            recentContext = viewModel.buildRecentContext(),
+                            deviceProfileId = deviceProfileId,
+                            assistantName = settings.assistantName
                         )
                     ) {
                         is NotebookReplyResult.Success -> viewModel.onRespondSuccess(
@@ -125,7 +128,9 @@ fun NotebookPageScreen(modifier: Modifier = Modifier) {
                             val result = NotebookApiClient.requestNotebookReply(
                                 baseUrl = BackendConfig.BASE_URL,
                                 imageBase64 = bitmap.toPngBase64(),
-                                recentContext = viewModel.buildRecentContext()
+                                recentContext = viewModel.buildRecentContext(),
+                                deviceProfileId = deviceProfileId,
+                                assistantName = settings.assistantName
                             )
                         ) {
                             is NotebookReplyResult.Success -> viewModel.onRespondSuccess(

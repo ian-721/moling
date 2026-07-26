@@ -8,6 +8,7 @@ import androidx.datastore.preferences.core.edit
 import androidx.datastore.preferences.core.stringPreferencesKey
 import androidx.datastore.preferences.preferencesDataStore
 import java.io.IOException
+import java.util.UUID
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.catch
 import kotlinx.coroutines.flow.map
@@ -37,7 +38,9 @@ class SettingsRepository(context: Context) {
                 paperBackground = PaperBackgroundOption.fromStoredValue(
                     preferences[Keys.PaperBackground]
                 ),
-                showDebugInfo = preferences[Keys.ShowDebugInfo] ?: true
+                showDebugInfo = preferences[Keys.ShowDebugInfo] ?: true,
+                assistantName = normalizeAssistantName(preferences[Keys.AssistantName]),
+                deviceProfileId = preferences[Keys.DeviceProfileId]
             )
         }
 
@@ -69,10 +72,30 @@ class SettingsRepository(context: Context) {
         }
     }
 
+    suspend fun setAssistantName(name: String?) {
+        dataStore.edit { preferences ->
+            preferences[Keys.AssistantName] = normalizeAssistantName(name)
+        }
+    }
+
+    suspend fun getOrCreateDeviceProfileId(): String {
+        var resolved = ""
+        dataStore.edit { preferences ->
+            resolved = preferences[Keys.DeviceProfileId].orEmpty()
+            if (resolved.isBlank()) {
+                resolved = UUID.randomUUID().toString()
+                preferences[Keys.DeviceProfileId] = resolved
+            }
+        }
+        return resolved
+    }
+
     private object Keys {
         val ReplyFontSize = stringPreferencesKey("reply_font_size")
         val SelectedFontAssetPath = stringPreferencesKey("selected_font_asset_path")
         val PaperBackground = stringPreferencesKey("paper_background")
         val ShowDebugInfo = booleanPreferencesKey("show_debug_info")
+        val AssistantName = stringPreferencesKey("assistant_name")
+        val DeviceProfileId = stringPreferencesKey("device_profile_id")
     }
 }

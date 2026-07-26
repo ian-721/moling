@@ -6,8 +6,19 @@ data class MolingSettings(
     val replyFontSize: ReplyFontSizeOption = ReplyFontSizeOption.Large,
     val selectedFontAssetPath: String? = null,
     val paperBackground: PaperBackgroundOption = PaperBackgroundOption.Parchment,
-    val showDebugInfo: Boolean = true
+    val showDebugInfo: Boolean = true,
+    val assistantName: String = DEFAULT_ASSISTANT_NAME,
+    val deviceProfileId: String? = null
 )
+
+const val DEFAULT_ASSISTANT_NAME = "\u58a8\u7075"
+
+fun normalizeAssistantName(value: String?): String {
+    val normalized = value?.trim()?.replace(Regex("\\s+"), " ").orEmpty()
+    return normalized.takeIf {
+        it.isNotBlank() && it.length <= 16 && it.none { character -> character.isISOControl() }
+    } ?: DEFAULT_ASSISTANT_NAME
+}
 
 enum class ReplyFontSizeOption(
     val label: String,
