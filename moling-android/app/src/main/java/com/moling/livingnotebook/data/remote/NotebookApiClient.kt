@@ -6,6 +6,7 @@ import org.json.JSONObject
 import java.io.OutputStreamWriter
 import java.net.HttpURLConnection
 import java.net.URL
+import java.util.UUID
 
 sealed class NotebookReplyResult {
     data class Success(
@@ -36,7 +37,9 @@ object NotebookApiClient {
         recognitionSource: String? = null,
         recentContext: String? = null,
         imageBase64: String? = null,
-        pageId: String? = null
+        pageId: String? = null,
+        deviceProfileId: String,
+        assistantName: String
     ): NotebookReplyResult = withContext(Dispatchers.IO) {
         var connection: HttpURLConnection? = null
         try {
@@ -50,7 +53,10 @@ object NotebookApiClient {
             }
 
             val requestBody = JSONObject().apply {
+                put("requestId", UUID.randomUUID().toString())
                 put("pageId", pageId ?: JSONObject.NULL)
+                put("deviceProfileId", deviceProfileId)
+                put("assistantName", assistantName)
                 put("recognizedText", recognizedText ?: JSONObject.NULL)
                 put("recognitionSource", recognitionSource ?: JSONObject.NULL)
                 put("recentContext", recentContext ?: JSONObject.NULL)
@@ -66,10 +72,7 @@ object NotebookApiClient {
             val responseText = stream?.bufferedReader(Charsets.UTF_8)?.use { it.readText() } ?: ""
 
             if (responseCode !in 200..299) {
-                val detail = runCatching { JSONObject(responseText).optString("detail") }.getOrNull()
-                return@withContext NotebookReplyResult.Failure(
-                    detail?.takeIf { it.isNotBlank() } ?: "后端返回错误（$responseCode）"
-                )
+                return@withContext NotebookReplyResult.Failure(errorMessage(responseCode, responseText))
             }
 
             val json = JSONObject(responseText)
@@ -83,6 +86,22 @@ object NotebookApiClient {
             NotebookReplyResult.Failure(e.message ?: "网络请求失败")
         } finally {
             connection?.disconnect()
+        }
+    }
+
+    internal fun errorMessage(responseCode: Int, responseText: String): String {
+        val detail = runCatching {
+            val raw = JSONObject(responseText).opt("detail")
+            when (raw) {
+                is JSONObject -> raw.optString("message")
+                is String -> raw
+                else -> null
+            }
+        }.getOrNull()
+        return detail?.takeIf { it.isNotBlank() } ?: when (responseCode) {
+            429 -> "\u56de\u5e94\u592a\u9891\u7e41\uff0c\u7a0d\u540e\u518d\u8bd5"
+            502, 503 -> "\u6a21\u578b\u670d\u52a1\u6682\u65f6\u4e0d\u53ef\u7528"
+            else -> "\u540e\u7aef\u8fd4\u56de\u9519\u8bef\uff08$responseCode\uff09"
         }
     }
 }

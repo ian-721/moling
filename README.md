@@ -1,108 +1,73 @@
 # 墨灵（Moling / Living Notebook）
 
-墨灵是一款 Android 平板优先的 AI 手写笔记本。
+墨灵是一款 Android 平板优先的 AI 手写笔记本。用户在纸面上写，客户端优先本地识别文字，服务端生成回应，回应再以墨迹浮现在纸面上。它不是聊天软件，也不会把纸面改造成气泡、头像或消息列表。
 
-用户在纸面界面上手写，客户端优先在本地识别文字，服务端生成回应，再由客户端以墨迹动画写回纸面。它不是聊天软件，核心体验是：
+## M0-A 生产基线
 
-> 写下，它会像一本熟悉你、有判断的笔记本一样回应。
+本仓库已建立 v0.8 后续工程所需的第一版生产边界：
 
-## 当前状态
+- 后端生产默认供应商为 DeepSeek，普通回应使用 `deepseek-v4-flash`，深度回应预留 `deepseek-v4-pro`；
+- 业务服务依赖 `ModelProvider` 协议，不直接绑定模型 SDK；
+- 使用 OpenAI-compatible `POST /chat/completions`、JSON Output、超时和最多一次受控重试；
+- Persona、模式路由、安全规则与输出 schema 已从 `main.py` 拆为版本化文件；
+- `assistant_name` 始终与 `user_id` 或匿名 `device_profile_id` 一起解析；
+- 生产日志只记录请求 ID、模型、耗时、Token、成本估算和错误类别，不记录笔记正文、最近上下文或完整回应；
+- Vision fallback 与图片落盘在生产配置中被强制关闭；
+- Android Debug/Release 后端地址由 BuildConfig 分离，Release 只接受 HTTPS 且禁止明文流量；
+- 本地开发可使用确定性的 fake provider，不需要真实 DeepSeek Key。
 
-当前仓库已有可运行的早期原型，核心链路已经形成，但生产化改造尚未完成。
-
-截至 2026-07-25，项目已经正式冻结以下方向：
-
-- 从内部原型进入正式上线工程；
-- 生产默认模型迁移到 DeepSeek V4；
-- 建设“老g”人格与每个用户隔离的私有记忆；
-- 完成本地持久化、账号与多端同步；
-- 推进 Google Play 和华为 AppGallery 实际上架；
-- 建设免费额度、订阅和统一权益架构。
-
-**重要：当前代码仍包含旧 OpenAI Responses API 原型实现和局域网开发配置。上述迁移尚未宣称完成，等待 M0-A 工程任务实际修改、测试和部署。**
+这只是 M0-A 代码基线。当前没有宣称生产后端已经部署、应用已经签名、真机已经验证或商店已经提交。
 
 ## 核心链路
 
 ```text
 用户 strokes
-→ 本地保存
-→ ML Kit 本地文字识别
-→ 服务端加载人格、记忆和最近上下文
-→ DeepSeek 生成结构化回应
+→ 保留在客户端并由 ML Kit 本地识别
+→ recognizedText + 当前隔离身份
+→ Moling backend ReplyService
+→ ModelProvider
+→ DeepSeek 结构化回应
 → InkReplyOverlay 墨迹浮现
-→ 本地保存并后台同步
 ```
 
-OpenAI Vision OCR 只保留为开发阶段的 fallback/debug 路径，不应作为默认识别方式或华为兼容问题的长期解决方案。
+识别、网络或模型失败时，现有客户端失败分支会恢复发送状态并保留原始 strokes。Vision 仍只是明确的开发 fallback，默认关闭。
 
 ## 仓库结构
 
 ```text
 moling/
-├─ moling-android/       # Kotlin + Jetpack Compose Android 客户端
-├─ backend/              # Python FastAPI 后端
-├─ docs/
-│  ├─ launch/            # 正式上线、人格、DeepSeek、商店与收费规划
-│  └─ ...                # 早期开发资料
-├─ AGENTS.md             # 当前最高优先级项目规则
-└─ README.md
+├─ backend/
+│  ├─ app/
+│  │  ├─ models/
+│  │  ├─ prompts/
+│  │  ├─ providers/
+│  │  └─ services/
+│  ├─ tests/
+│  ├─ main.py
+│  └─ .env.example
+├─ moling-android/
+├─ scripts/secret_scan.py
+├─ docs/launch/
+└─ AGENTS.md
 ```
 
-## 正式规划
+开发前必须完整阅读根目录 `AGENTS.md` 和 `docs/launch/`。产品品牌固定为“墨灵 / Moling”；角色显示名由每个用户自行设置。名称相同绝不代表身份、关系或记忆相同，任何未来记忆存储都只能按认证用户或匿名设备作用域读取。
 
-开发前必须阅读：
+## 后端本地运行
 
-1. [`docs/launch/01_MOLING_LAUNCH_MASTER_PLAN.md`](docs/launch/01_MOLING_LAUNCH_MASTER_PLAN.md)
-2. [`docs/launch/02_OLD_G_PERSONA_AND_MEMORY_SPEC.md`](docs/launch/02_OLD_G_PERSONA_AND_MEMORY_SPEC.md)
-3. [`docs/launch/03_DEEPSEEK_BACKEND_AND_COST_PLAN.md`](docs/launch/03_DEEPSEEK_BACKEND_AND_COST_PLAN.md)
-4. [`docs/launch/04_STORE_SYNC_MONETIZATION_PLAN.md`](docs/launch/04_STORE_SYNC_MONETIZATION_PLAN.md)
-5. [`docs/launch/05_CODEX_FIRST_EXECUTION_PROMPT.md`](docs/launch/05_CODEX_FIRST_EXECUTION_PROMPT.md)
-
-根目录 [`AGENTS.md`](AGENTS.md) 与上述文件构成当前正式基线。
-
-## 技术栈
-
-### Android
-
-- Kotlin
-- Jetpack Compose
-- Canvas / PathMeasure 墨迹动画
-- ML Kit Digital Ink Recognition
-- DataStore
-- 计划加入本地数据库与同步队列
-
-### Backend
-
-当前原型：
-
-- Python
-- FastAPI
-- OpenAI Responses API
-
-冻结的生产目标：
-
-- FastAPI
-- DeepSeek OpenAI-compatible Chat Completions API
-- `deepseek-v4-flash` 默认回应
-- `deepseek-v4-pro` 深度回应
-- 供应商适配层
-- JSON Output
-- 鉴权、限流、预算和脱敏日志
-
-## 当前本地启动方式
-
-以下仅适用于当前原型开发环境，M0-A 完成后将更新。
-
-### 后端
+推荐 Python 3.12+。
 
 ```powershell
 cd backend
 python -m venv .venv
 .\.venv\Scripts\Activate.ps1
-pip install -r requirements.txt
+python -m pip install -r requirements-dev.txt
 Copy-Item .env.example .env
-uvicorn main:app --host 0.0.0.0 --port 8000
+python -m pytest -q
+uvicorn main:app --host 127.0.0.1 --port 8000
 ```
+
+`.env.example` 默认使用 `MODEL_PROVIDER=fake`，因此测试、健康检查和本地 smoke test 不需要联网或真实 Key。
 
 健康检查：
 
@@ -110,46 +75,88 @@ uvicorn main:app --host 0.0.0.0 --port 8000
 GET http://127.0.0.1:8000/healthz
 ```
 
-核心接口：
+文本回应：
 
-```text
+```json
 POST /api/notebook/reply
+{
+  "requestId": "request-uuid",
+  "deviceProfileId": "device-profile-uuid",
+  "assistantName": "墨灵",
+  "recognizedText": "今天先做哪一步",
+  "recognitionSource": "mlkit",
+  "recentContext": null
+}
 ```
 
-真实 API Key 不得写入代码、Android 客户端、Git、日志或提交历史。
+`userId` 与 `deviceProfileId` 必须且只能提供一个。M0-A 先固定这个作用域边界；真实 Access Token 校验、账号 profile store、限流和预算闸门属于下一轮 M0-B。
 
-### Android
+## DeepSeek 生产配置
 
-1. 使用 Android Studio 打开 `moling-android/`；
-2. 等待 Gradle Sync；
-3. 当前原型仍通过 `BackendConfig.kt` 指定局域网地址；
-4. 真机与后端电脑需位于同一局域网；
-5. 执行 Build 和 Run。
+部署时从 Secret 管理注入：
 
-该流程不是生产发布方式。M0-A 必须改成 Debug/Release 环境分离，Release 只使用 HTTPS。
+```env
+MOLING_ENV=production
+MODEL_PROVIDER=deepseek
+DEEPSEEK_API_KEY=<deployment-secret>
+PROVIDER_USER_ID_SALT=<deployment-secret>
+```
 
-## 已知上线阻塞
+其余非 Secret 默认值见 `backend/.env.example`。生产启动校验会拒绝：
 
-- 后端仍是 OpenAI 原型调用；
-- Android 后端地址仍为局域网硬编码；
-- Release 仍允许明文 HTTP；
-- 无正式鉴权、限流和全局预算；
-- 生产日志可能包含用户正文；
-- Vision debug 图片可能落盘；
-- 本地笔记持久化与同步尚未完成；
-- 未建立签名 APK/AAB 和商店发布流程；
-- 华为等无 GMS 设备可能无法下载 ML Kit 模型；
-- CI、自动化测试和全新环境复现仍需完成；
-- 约 50 MB 手写字体资源仍需评估。
+- 缺少 DeepSeek Key；
+- fake provider；
+- 非 HTTPS DeepSeek base URL；
+- 非规划模型名；
+- 默认开发盐；
+- 启用 Vision fallback 或图片落盘。
 
-## 当前下一步
+DeepSeek Key、provider salt、签名密钥和私人 memory seed 不得进入 Android、Git、日志、测试快照或注释。
 
-Codex 额度恢复后，直接执行：
+## Android 构建配置
 
-[`docs/launch/05_CODEX_FIRST_EXECUTION_PROMPT.md`](docs/launch/05_CODEX_FIRST_EXECUTION_PROMPT.md)
+Debug 默认使用模拟器可访问的本机地址：
 
-首轮必须同时完成基线核验与实际代码交付，不能只输出审计报告。
+```text
+http://10.0.2.2:8000
+```
 
-## 开发规则
+可在本地 `gradle.properties` 或命令行覆盖：
 
-修改代码前必须阅读 [`AGENTS.md`](AGENTS.md)。其中定义了产品本质、DeepSeek 模型决策、老g人格、用户记忆隔离、密钥边界、上线顺序和禁止破坏的体验约束。
+```powershell
+.\gradlew.bat :app:testDebugUnitTest :app:assembleDebug `
+  -PMOLING_DEBUG_BACKEND_URL=http://192.168.1.10:8000
+```
+
+Release 默认占位 URL 为 `https://api.moling.app`。真实部署域名确定后通过构建属性注入：
+
+```powershell
+.\gradlew.bat :app:assembleRelease `
+  -PMOLING_RELEASE_BACKEND_URL=https://api.example.com
+```
+
+Release 配置阶段会拒绝 `http://`，合并后的 Manifest 将 `usesCleartextTraffic` 设为 `false`。普通设置页不提供任意后端 URL。
+
+## 验证
+
+```powershell
+cd backend
+python -m pytest -q
+cd ..
+python scripts/secret_scan.py
+
+cd moling-android
+.\gradlew.bat :app:testDebugUnitTest :app:assembleDebug :app:assembleRelease
+```
+
+GitHub Actions 会执行后端测试、源代码 Secret 扫描、Android Debug 单元测试以及 Debug/Release 构建。
+
+## 仍待 M0-B 完成
+
+- Android Access Token 与服务端强制认证；
+- 按认证用户持久化的 profile store，账号切换/登出清理；
+- 限流、每日/月度额度、全局预算熔断与幂等请求存储；
+- 本地页面/strokes/reply 数据库、请求状态机和进程重启后的失败恢复；
+- 生产 HTTPS 部署与远程 smoke test；
+- 签名密钥体系、v0.8 签名 APK/AAB 和真机验证；
+- 无 GMS 华为设备的识别模型状态与替代识别路径验证。
