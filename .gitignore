@@ -23,6 +23,9 @@ backend/.tmp/
 .coverage
 htmlcov/
 *.egg-info/
+*.db
+*.sqlite
+*.sqlite3
 
 # Android / Gradle
 .gradle/

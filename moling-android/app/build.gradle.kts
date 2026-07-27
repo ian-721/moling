@@ -1,3 +1,5 @@
+import java.net.URI
+
 plugins {
     alias(libs.plugins.android.application)
     alias(libs.plugins.kotlin.compose)
@@ -6,8 +8,8 @@ plugins {
 
 val debugBackendUrl = providers.gradleProperty("MOLING_DEBUG_BACKEND_URL")
     .orElse("http://10.0.2.2:8000")
-val releaseBackendUrl = providers.gradleProperty("MOLING_RELEASE_BACKEND_URL")
-    .orElse("https://api.moling.app")
+val releaseBackendUrlProperty = providers.gradleProperty("MOLING_RELEASE_BACKEND_URL")
+val releaseBackendUrl = releaseBackendUrlProperty.orElse("https://release.invalid")
 
 fun quoted(value: String): String = "\"${value.replace("\\", "\\\\").replace("\"", "\\\"")}\""
 
@@ -65,8 +67,24 @@ android {
         }
         release {
             val productionUrl = releaseBackendUrl.get()
-            require(productionUrl.startsWith("https://")) {
-                "MOLING_RELEASE_BACKEND_URL must use HTTPS"
+            val productionUri = runCatching { URI(productionUrl) }.getOrNull()
+            require(
+                productionUri != null &&
+                    productionUri.scheme.equals("https", ignoreCase = true) &&
+                    !productionUri.host.isNullOrBlank() &&
+                    productionUri.rawUserInfo == null &&
+                    productionUri.rawQuery == null &&
+                    productionUri.rawFragment == null
+            ) {
+                "MOLING_RELEASE_BACKEND_URL must be a valid HTTPS URL without credentials, query, or fragment"
+            }
+            if (releaseSigningConfigured) {
+                require(releaseBackendUrlProperty.isPresent) {
+                    "A signed Release requires an explicit MOLING_RELEASE_BACKEND_URL"
+                }
+                require(!productionUri!!.host.endsWith(".invalid", ignoreCase = true)) {
+                    "A signed Release cannot use the reserved .invalid hostname"
+                }
             }
             buildConfigField("String", "BACKEND_BASE_URL", quoted(productionUrl))
             buildConfigField("Boolean", "ENABLE_VISION_FALLBACK", "false")

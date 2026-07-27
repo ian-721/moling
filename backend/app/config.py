@@ -9,10 +9,51 @@ class ConfigurationError(RuntimeError):
     """Raised when deployment configuration is unsafe or incomplete."""
 
 
-def _as_bool(value: str | None, default: bool = False) -> bool:
+MIN_HMAC_SECRET_BYTES = 32
+SECRET_PLACEHOLDER_MARKERS = (
+    "placeholder",
+    "not-a-secret",
+    "development-only",
+    "change-me",
+    "changeme",
+)
+
+
+def _validate_production_secret(
+    name: str,
+    value: str | None,
+    *,
+    minimum_bytes: int | None = None,
+) -> None:
+    if value is None or not value.strip():
+        raise ConfigurationError(
+            f"Production requires {name} from deployment secrets"
+        )
+    if value != value.strip():
+        raise ConfigurationError(
+            f"Production {name} must not contain outer whitespace"
+        )
+    normalized = value.casefold()
+    if any(marker in normalized for marker in SECRET_PLACEHOLDER_MARKERS):
+        raise ConfigurationError(
+            f"Production {name} must not use a known placeholder value"
+        )
+    if minimum_bytes is not None and len(value.encode("utf-8")) < minimum_bytes:
+        raise ConfigurationError(
+            f"Production {name} must be at least {minimum_bytes} UTF-8 bytes"
+        )
+
+
+def _as_bool(name: str, default: bool = False) -> bool:
+    value = os.getenv(name)
     if value is None:
         return default
-    return value.strip().lower() in {"1", "true", "yes", "on"}
+    normalized = value.strip().lower()
+    if normalized in {"1", "true", "yes", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "off"}:
+        return False
+    raise ConfigurationError(f"{name} must be true or false")
 
 
 def _as_int(name: str, default: int) -> int:
@@ -97,21 +138,15 @@ class Settings:
             provider_user_id_salt=os.getenv(
                 "PROVIDER_USER_ID_SALT", "development-only-salt"
             ),
-            vision_fallback_enabled=_as_bool(
-                os.getenv("VISION_FALLBACK_ENABLED"), False
-            ),
-            debug_image_save_enabled=_as_bool(
-                os.getenv("DEBUG_IMAGE_SAVE_ENABLED"), False
-            ),
+            vision_fallback_enabled=_as_bool("VISION_FALLBACK_ENABLED", False),
+            debug_image_save_enabled=_as_bool("DEBUG_IMAGE_SAVE_ENABLED", False),
             log_level=os.getenv("LOG_LEVEL", "INFO"),
             database_url=os.getenv("DATABASE_URL", "sqlite:///./moling.db"),
             token_hash_pepper=os.getenv(
                 "TOKEN_HASH_PEPPER", "development-only-token-pepper"
             ),
             access_token_ttl_seconds=_as_int("ACCESS_TOKEN_TTL_SECONDS", 2_592_000),
-            registration_enabled=_as_bool(
-                os.getenv("REGISTRATION_ENABLED"), True
-            ),
+            registration_enabled=_as_bool("REGISTRATION_ENABLED", True),
             registration_requests_per_minute=_as_int(
                 "REGISTRATION_REQUESTS_PER_MINUTE", 30
             ),
@@ -191,28 +226,24 @@ class Settings:
                 raise ConfigurationError(
                     "Production requires MODEL_PROVIDER=deepseek"
                 )
-            if not self.deepseek_api_key:
-                raise ConfigurationError(
-                    "Production requires DEEPSEEK_API_KEY from deployment secrets"
-                )
-            if (
-                not self.provider_user_id_salt
-                or self.provider_user_id_salt == "development-only-salt"
-            ):
-                raise ConfigurationError(
-                    "Production requires a secret PROVIDER_USER_ID_SALT"
-                )
+            _validate_production_secret(
+                "DEEPSEEK_API_KEY",
+                self.deepseek_api_key,
+            )
+            _validate_production_secret(
+                "PROVIDER_USER_ID_SALT",
+                self.provider_user_id_salt,
+                minimum_bytes=MIN_HMAC_SECRET_BYTES,
+            )
             if self.vision_fallback_enabled or self.debug_image_save_enabled:
                 raise ConfigurationError(
                     "Production must disable Vision fallback and image persistence"
                 )
-            if (
-                not self.token_hash_pepper
-                or self.token_hash_pepper == "development-only-token-pepper"
-            ):
-                raise ConfigurationError(
-                    "Production requires TOKEN_HASH_PEPPER from deployment secrets"
-                )
+            _validate_production_secret(
+                "TOKEN_HASH_PEPPER",
+                self.token_hash_pepper,
+                minimum_bytes=MIN_HMAC_SECRET_BYTES,
+            )
             if not (
                 self.database_url.startswith("postgresql://")
                 or self.database_url.startswith("postgresql+psycopg://")
