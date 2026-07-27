@@ -12,8 +12,9 @@ cd moling-android
 
 `versionCode=800`, `versionName=0.8.0`, and package name
 `com.moling.livingnotebook` are fixed for this baseline. Debug defaults to
-`http://10.0.2.2:8000`. Release defaults to
-`https://api.moling.app` and rejects non-HTTPS overrides:
+`http://10.0.2.2:8000`. Unsigned Release CI defaults to the non-routable
+`https://release.invalid`; a permanently signed Release requires an explicit,
+valid HTTPS override:
 
 ```powershell
 .\gradlew.bat :app:assembleRelease :app:bundleRelease `
@@ -40,6 +41,15 @@ fails at Gradle configuration time. With none of the variables set, CI still
 builds the unsigned Release APK/AAB baseline. Do not create a temporary
 permanent keystore merely to make a signed-artifact claim.
 
+Before a real signed build, run the repository preflight. It suppresses
+signing values and requires a readable keystore without printing its path:
+
+```powershell
+python ..\scripts\android_release_preflight.py `
+  --backend-url 'https://<authorized-host>' `
+  --require-signing
+```
+
 Expected untracked outputs:
 
 - `app/build/outputs/apk/debug/app-debug.apk`
@@ -61,3 +71,7 @@ during absorption remain. Vision must not be enabled to hide an ML Kit failure.
 
 If no authorized physical device is connected, APK generation is a code/build
 result only; it is not a true-device pass.
+
+Record each physical device separately using
+`docs/release/V0_8_DEVICE_ACCEPTANCE_TEMPLATE.md`. Keep filled records and raw
+artifacts outside Git in a controlled evidence directory.

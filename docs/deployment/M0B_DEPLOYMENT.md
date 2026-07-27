@@ -33,14 +33,22 @@ enabled.
 ## Deployment verification
 
 1. Build the image without any `.env` file in its context.
-2. Run migrations against a staging PostgreSQL database.
-3. Verify `GET /healthz` and `GET /readyz` through the HTTPS hostname.
-4. Register a disposable installation, read/patch its profile, and send one
-   authenticated fake/staging-provider reply.
-5. Verify a request without Bearer auth returns 401 and repeated `requestId`
-   returns the original response.
-6. Confirm logs contain no Authorization header, token hash, note text, recent
-   context, or full reply.
+2. Run `python scripts/deployment_preflight.py` inside the runtime Secret
+   environment; it validates names and safety without printing values or
+   opening a network connection.
+3. Run migrations against a staging PostgreSQL database.
+4. Run the default probe-only `scripts/remote_https_smoke.py` against an
+   explicitly supplied HTTPS hostname.
+5. With staging writes and model cost explicitly authorized, add
+   `--exercise-api` to register a disposable installation, reuse its Token,
+   read/patch Profile, read Usage, exercise normal/deep replies, replay a
+   request ID and verify a changed payload conflicts.
+6. Confirm platform and ingress logs contain no Authorization header, token
+   hash, note text, recent context, full reply, database URL or Secret.
+
+The complete pre-deploy, post-deploy, quota/budget, log and data-preserving
+rollback protocol is
+`docs/deployment/M0B3A_REAL_ENVIRONMENT_PREFLIGHT.md`.
 
 ## Rollback
 

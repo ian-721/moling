@@ -94,7 +94,10 @@ cd moling-android
   :app:assembleDebug :app:assembleRelease :app:bundleRelease
 ```
 
-Release URL 通过 `-PMOLING_RELEASE_BACKEND_URL=https://...` 注入，且必须 HTTPS。签名只读取四个 `MOLING_KEYSTORE_*` 环境变量；缺少时仍可构建 unsigned Release。完整步骤见 `docs/release/V0_8_BUILD_SIGN_INSTALL.md`。
+Release URL 通过 `-PMOLING_RELEASE_BACKEND_URL=https://...` 注入，且必须 HTTPS。
+unsigned CI 基线使用不可路由的 `https://release.invalid`；永久签名构建必须显式
+提供真实 hostname。签名只读取四个 `MOLING_KEYSTORE_*` 环境变量；全无时仍可
+构建 unsigned Release。完整步骤见 `docs/release/V0_8_BUILD_SIGN_INSTALL.md`。
 
 ## 验证
 
@@ -108,6 +111,21 @@ python scripts/secret_scan.py
 ```
 
 CI 执行迁移 smoke、后端测试、生产配置负向测试、Secret scan、Android Room/身份/恢复单测、lint、Debug/Release APK 与 Release AAB 构建。CI 不需要真实 DeepSeek、PostgreSQL、签名或云平台凭据。
+
+M0-B.3A 进一步使用 CI PostgreSQL 17 服务执行全新数据库 migration smoke，
+并在不复制 `.env` 的情况下构建 Docker image。真实部署前可执行：
+
+```powershell
+python scripts/deployment_preflight.py
+python scripts/android_release_preflight.py `
+  --backend-url 'https://<authorized-host>'
+python scripts/remote_https_smoke.py `
+  --base-url 'https://<authorized-host>'
+```
+
+远程 smoke 默认不创建数据或调用模型；只有显式加入 `--exercise-api` 才会创建
+一次性 principal 并调用普通/深度回复。完整差距矩阵、外部输入和回滚协议见
+`docs/deployment/M0B3A_REAL_ENVIRONMENT_PREFLIGHT.md`。
 
 ## M0-C 不在本轮
 
