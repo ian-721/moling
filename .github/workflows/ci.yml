@@ -16,8 +16,8 @@ jobs:
         image: postgres:17-alpine
         env:
           POSTGRES_USER: moling
-          POSTGRES_PASSWORD: ci-only-password
           POSTGRES_DB: moling_ci
+          POSTGRES_HOST_AUTH_METHOD: trust
         ports:
           - 5432:5432
         options: >-
@@ -36,24 +36,38 @@ jobs:
             backend/requirements-dev.txt
       - name: Install backend dependencies
         run: python -m pip install -r backend/requirements-dev.txt
+      - name: Check backend dependency consistency
+        run: python -m pip check
       - name: Run migration smoke
         working-directory: backend
         env:
-          DATABASE_URL: postgresql+psycopg://moling:ci-only-password@localhost:5432/moling_ci
+          DATABASE_URL: postgresql+psycopg://moling@localhost:5432/moling_ci
         run: |
           python -m alembic upgrade head
           python -m alembic check
       - name: Run backend tests
         working-directory: backend
         run: python -m pytest -q
-      - name: Run production configuration preflight with CI placeholders
+      - name: Generate masked ephemeral preflight secrets
+        shell: bash
+        run: |
+          set -euo pipefail
+          deepseek_key="ci-$(openssl rand -hex 32)"
+          provider_salt="$(openssl rand -hex 32)"
+          token_pepper="$(openssl rand -hex 32)"
+          printf '::add-mask::%s\n' "$deepseek_key"
+          printf '::add-mask::%s\n' "$provider_salt"
+          printf '::add-mask::%s\n' "$token_pepper"
+          {
+            printf 'DEEPSEEK_API_KEY=%s\n' "$deepseek_key"
+            printf 'PROVIDER_USER_ID_SALT=%s\n' "$provider_salt"
+            printf 'TOKEN_HASH_PEPPER=%s\n' "$token_pepper"
+          } >> "$GITHUB_ENV"
+      - name: Run production configuration preflight
         env:
           MOLING_ENV: production
           MODEL_PROVIDER: deepseek
-          DATABASE_URL: postgresql+psycopg://moling:ci-only-password@localhost:5432/moling_ci
-          DEEPSEEK_API_KEY: ci-placeholder-not-a-secret
-          PROVIDER_USER_ID_SALT: ci-provider-salt-not-a-secret
-          TOKEN_HASH_PEPPER: ci-token-pepper-not-a-secret
+          DATABASE_URL: postgresql+psycopg://moling@localhost:5432/moling_ci
           ACCESS_TOKEN_TTL_SECONDS: "2592000"
           REGISTRATION_ENABLED: "true"
           REGISTRATION_REQUESTS_PER_MINUTE: "30"

@@ -60,7 +60,11 @@ def main() -> int:
     print("PASS production environment selected")
     print("PASS DeepSeek production provider selected")
     print("PASS PostgreSQL runtime URL selected")
-    print("PASS runtime secrets are present (values suppressed)")
+    print(
+        "PASS Secret placeholder/whitespace gates and HMAC minimum-length "
+        "gates passed (values suppressed; DeepSeek credential authenticity "
+        "not network-verified)"
+    )
     print("PASS authentication, quota, lease, and budget controls are explicit")
     print("PASS Vision fallback and debug image persistence are disabled")
     print("PASS deployment preflight completed without opening a network connection")

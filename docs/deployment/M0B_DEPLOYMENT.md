@@ -18,8 +18,10 @@ Inject these through the deployment platform's secret/config manager:
 - `MOLING_ENV=production`
 - `MODEL_PROVIDER=deepseek`
 - `DEEPSEEK_API_KEY` (secret)
-- `PROVIDER_USER_ID_SALT` (secret)
-- `TOKEN_HASH_PEPPER` (secret; changing it invalidates all access tokens)
+- `PROVIDER_USER_ID_SALT` (independent high-entropy secret, at least 32 UTF-8
+  bytes)
+- `TOKEN_HASH_PEPPER` (independent high-entropy secret, at least 32 UTF-8
+  bytes; changing it invalidates all access tokens)
 - `DATABASE_URL=postgresql+psycopg://...` (secret)
 - every authentication, registration, rate, quota, lease, and budget variable
   listed in `backend/.env.example`
@@ -34,15 +36,17 @@ enabled.
 
 1. Build the image without any `.env` file in its context.
 2. Run `python scripts/deployment_preflight.py` inside the runtime Secret
-   environment; it validates names and safety without printing values or
-   opening a network connection.
+   environment; it rejects known placeholder markers, outer whitespace and
+   short HMAC secrets without printing values or opening a network connection.
 3. Run migrations against a staging PostgreSQL database.
 4. Run the default probe-only `scripts/remote_https_smoke.py` against an
    explicitly supplied HTTPS hostname.
 5. With staging writes and model cost explicitly authorized, add
    `--exercise-api` to register a disposable installation, reuse its Token,
-   read/patch Profile, read Usage, exercise normal/deep replies, replay a
-   request ID and verify a changed payload conflicts.
+   read/patch Profile, read Usage, exercise normal/deep DeepSeek replies,
+   validate provider/model/degradation/response fields, replay a request ID,
+   verify a changed payload conflicts, and prove Usage increases only for the
+   two original successful provider calls.
 6. Confirm platform and ingress logs contain no Authorization header, token
    hash, note text, recent context, full reply, database URL or Secret.
 

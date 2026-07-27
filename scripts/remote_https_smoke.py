@@ -17,6 +17,12 @@ class Result:
     body: dict[str, Any]
 
 
+@dataclass(frozen=True)
+class UsageSnapshot:
+    daily_used: int
+    monthly_used: int
+
+
 class SmokeFailure(RuntimeError):
     pass
 
@@ -27,6 +33,21 @@ class _NoRedirect(HTTPRedirectHandler):
 
 
 OPENER = build_opener(_NoRedirect)
+FLASH_MODEL = "deepseek-v4-flash"
+PRO_MODEL = "deepseek-v4-pro"
+REPLY_MODES = {
+    "companion",
+    "mirror",
+    "judgment",
+    "root_cause",
+    "decision",
+    "execution",
+    "grounding",
+    "challenge",
+    "quiet",
+    "safety",
+}
+SAFETY_LEVELS = {"normal", "elevated", "critical"}
 
 
 def _safe_json(raw: bytes) -> dict[str, Any]:
@@ -117,6 +138,105 @@ def _validate_target(base_url: str) -> str:
     return normalized
 
 
+def _usage_snapshot(label: str, result: Result) -> UsageSnapshot:
+    _expect(f"{label} HTTP", result, 200)
+    integer_fields = (
+        "dailyUsed",
+        "dailyLimit",
+        "monthlyUsed",
+        "monthlyLimit",
+    )
+    for field in integer_fields:
+        value = result.body.get(field)
+        if type(value) is not int:
+            raise SmokeFailure(f"{label}: {field} must be an integer")
+        if value < 0:
+            raise SmokeFailure(f"{label}: {field} must not be negative")
+    if result.body["dailyLimit"] <= 0 or result.body["monthlyLimit"] <= 0:
+        raise SmokeFailure(f"{label}: usage limits must be positive")
+    print(f"PASS {label} response contract")
+    return UsageSnapshot(
+        daily_used=result.body["dailyUsed"],
+        monthly_used=result.body["monthlyUsed"],
+    )
+
+
+def _expect_usage_delta(
+    label: str,
+    current: UsageSnapshot,
+    baseline: UsageSnapshot,
+    expected_delta: int,
+) -> None:
+    if (
+        current.daily_used != baseline.daily_used + expected_delta
+        or current.monthly_used != baseline.monthly_used + expected_delta
+    ):
+        raise SmokeFailure(
+            f"{label}: daily/monthly usage did not change by {expected_delta}"
+        )
+    print(f"PASS {label}")
+
+
+def _require_nonempty_string(
+    label: str,
+    body: dict[str, Any],
+    field: str,
+) -> str:
+    value = body.get(field)
+    if not isinstance(value, str) or not value.strip():
+        raise SmokeFailure(f"{label}: {field} must be a non-empty string")
+    return value
+
+
+def _validate_reply_contract(
+    label: str,
+    result: Result,
+    *,
+    request_id: str,
+    deep_mode: bool,
+) -> None:
+    _expect(f"{label} HTTP", result, 200)
+    body = result.body
+    returned_request_id = _require_nonempty_string(label, body, "requestId")
+    if returned_request_id != request_id:
+        raise SmokeFailure(f"{label}: response requestId did not match the request")
+    _require_nonempty_string(label, body, "recognizedText")
+    _require_nonempty_string(label, body, "aiReply")
+    _require_nonempty_string(label, body, "recognitionSource")
+    _require_nonempty_string(label, body, "promptVersion")
+
+    response_mode = body.get("responseMode")
+    if response_mode not in REPLY_MODES:
+        raise SmokeFailure(f"{label}: responseMode was outside the contract")
+    safety_level = body.get("safetyLevel")
+    if safety_level not in SAFETY_LEVELS:
+        raise SmokeFailure(f"{label}: safetyLevel was outside the contract")
+    if type(body.get("shouldAsk")) is not bool:
+        raise SmokeFailure(f"{label}: shouldAsk must be a boolean")
+    if body.get("provider") != "deepseek":
+        raise SmokeFailure(f"{label}: provider must be deepseek")
+    if type(body.get("degraded")) is not bool:
+        raise SmokeFailure(f"{label}: degraded must be a boolean")
+
+    model = body.get("model")
+    degraded = body["degraded"]
+    if not deep_mode:
+        if model != FLASH_MODEL or degraded:
+            raise SmokeFailure(
+                f"{label}: normal reply must use {FLASH_MODEL} without degradation"
+            )
+    elif degraded:
+        if model != FLASH_MODEL:
+            raise SmokeFailure(
+                f"{label}: degraded deep reply must fall back to {FLASH_MODEL}"
+            )
+    elif model != PRO_MODEL:
+        raise SmokeFailure(
+            f"{label}: non-degraded deep reply must use {PRO_MODEL}"
+        )
+    print(f"PASS {label} DeepSeek response contract")
+
+
 def run(base_url: str, timeout: float, exercise_api: bool) -> None:
     health = _request(base_url, "GET", "/healthz", timeout=timeout)
     _expect("HTTPS /healthz", health, 200)
@@ -171,10 +291,12 @@ def run(base_url: str, timeout: float, exercise_api: bool) -> None:
     if renamed.body.get("assistantName") != acceptance_name:
         raise SmokeFailure("profile rename was not persisted")
 
-    usage = _request(
-        base_url, "GET", "/api/usage", timeout=timeout, token=token
+    initial_usage = _usage_snapshot(
+        "initial principal usage",
+        _request(
+            base_url, "GET", "/api/usage", timeout=timeout, token=token
+        ),
     )
-    _expect("principal usage read", usage, 200)
 
     request_id = f"smoke-{uuid4()}"
     normal_payload = {
@@ -193,7 +315,24 @@ def run(base_url: str, timeout: float, exercise_api: bool) -> None:
         token=token,
         body=normal_payload,
     )
-    _expect("real normal reply", normal, 200)
+    _validate_reply_contract(
+        "normal reply",
+        normal,
+        request_id=request_id,
+        deep_mode=False,
+    )
+    usage_after_normal = _usage_snapshot(
+        "usage after normal reply",
+        _request(
+            base_url, "GET", "/api/usage", timeout=timeout, token=token
+        ),
+    )
+    _expect_usage_delta(
+        "normal reply charged exactly one request",
+        usage_after_normal,
+        initial_usage,
+        1,
+    )
 
     replay = _request(
         base_url,
@@ -203,9 +342,26 @@ def run(base_url: str, timeout: float, exercise_api: bool) -> None:
         token=token,
         body=normal_payload,
     )
-    _expect("same requestId idempotent replay", replay, 200)
+    _validate_reply_contract(
+        "same requestId idempotent replay",
+        replay,
+        request_id=request_id,
+        deep_mode=False,
+    )
     if replay.body != normal.body:
         raise SmokeFailure("idempotent replay did not return the stored response")
+    usage_after_replay = _usage_snapshot(
+        "usage after idempotent replay",
+        _request(
+            base_url, "GET", "/api/usage", timeout=timeout, token=token
+        ),
+    )
+    _expect_usage_delta(
+        "idempotent replay did not consume usage",
+        usage_after_replay,
+        usage_after_normal,
+        0,
+    )
 
     conflict_payload = dict(normal_payload)
     conflict_payload["recognizedText"] = "不同载荷必须触发幂等冲突。"
@@ -223,6 +379,18 @@ def run(base_url: str, timeout: float, exercise_api: bool) -> None:
         409,
         code="idempotency_conflict",
     )
+    usage_after_conflict = _usage_snapshot(
+        "usage after idempotency conflict",
+        _request(
+            base_url, "GET", "/api/usage", timeout=timeout, token=token
+        ),
+    )
+    _expect_usage_delta(
+        "idempotency conflict did not consume usage",
+        usage_after_conflict,
+        usage_after_replay,
+        0,
+    )
 
     deep_payload = dict(normal_payload)
     deep_payload.update(
@@ -238,7 +406,24 @@ def run(base_url: str, timeout: float, exercise_api: bool) -> None:
         token=token,
         body=deep_payload,
     )
-    _expect("real deep reply", deep, 200)
+    _validate_reply_contract(
+        "deep reply",
+        deep,
+        request_id=deep_payload["requestId"],
+        deep_mode=True,
+    )
+    usage_after_deep = _usage_snapshot(
+        "usage after deep reply",
+        _request(
+            base_url, "GET", "/api/usage", timeout=timeout, token=token
+        ),
+    )
+    _expect_usage_delta(
+        "deep reply charged exactly one request",
+        usage_after_deep,
+        usage_after_conflict,
+        1,
+    )
     print("PASS mutating smoke completed; token and response content were suppressed")
 
 

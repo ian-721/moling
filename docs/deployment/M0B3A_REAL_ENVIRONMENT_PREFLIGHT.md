@@ -34,7 +34,7 @@
 |---|---|---|---|---|---|---|
 | Docker 不依赖 `.env` 构建 | 源码满足，CI 关卡已新增；本机无 Docker CLI | `backend/Dockerfile`、`backend/.dockerignore`、`.github/workflows/ci.yml` | P0 | 是，新增 CI build | 否 | 本分支 CI 必须通过 `docker build ./backend` |
 | PostgreSQL/DeepSeek/pepper/salt 仅运行时注入 | 已满足；image 不复制环境文件 | `backend/app/config.py`、`backend/.env.example`、`backend/Dockerfile` | P0 | 否 | 是 | 部署平台 Secret 管理器注入，禁止粘贴到聊天/Git/日志 |
-| 生产缺失/默认配置拒绝启动 | 已满足并有自动负向测试 | `backend/app/config.py`、`backend/tests/test_config.py`、`scripts/deployment_preflight.py` | P0 | 是，新增 preflight | 是 | 部署前在目标平台 Secret 环境运行 preflight |
+| 生产缺失/默认/placeholder/低强度配置拒绝启动 | 已满足并有自动负向测试；HMAC salt/pepper 最少 32 UTF-8 bytes | `backend/app/config.py`、`backend/tests/test_config.py`、`backend/tests/test_preflight_scripts.py`、`scripts/deployment_preflight.py` | P0 | 是 | 是 | 部署前在目标平台 Secret 环境运行 preflight |
 | 全新 PostgreSQL `upgrade head` | 仓库 CI 骨架已补齐；真实实例仍待执行 | `.github/workflows/ci.yml`、`backend/migrations/` | P0 | 是 | 是 | CI PostgreSQL 17 smoke；M0-B.3B 对真实 staging PostgreSQL 再执行 |
 | readiness 验证数据库 | 已满足，执行 `SELECT 1`，失败返回 503 | `backend/app/api.py` | P0 | 否 | 是 | 经生产 HTTPS hostname 调用 `/readyz` |
 | 日志无 Token/正文/上下文/回复 | 应用日志守卫已覆盖；平台 ingress 日志仍待检查 | `backend/tests/test_api.py`、`backend/app/api.py` | P0 | 是，扩展测试 | 是 | 真实 smoke 后查询平台日志并保存脱敏证据 |
@@ -118,8 +118,17 @@ python .\scripts\remote_https_smoke.py `
 ```
 
 脚本创建一次性匿名设备 principal，复用同一 Bearer Token 完成 Profile
-读取/改名、Usage 读取、普通回复、深度回复、相同 `requestId` 重放和不同
-payload 的 409 冲突。脚本不打印 Token、回应正文或 Secret。
+读取/改名和 Usage 读取，并验证：
+
+- 普通响应为 `provider=deepseek`、Flash、`degraded=false`；
+- 深度响应为 Pro，或 `degraded=true` 时明确降级到 Flash；
+- `requestId` 和必要响应字段完整且匹配；
+- 普通回复后日/月 Usage 各增加 1；
+- 相同 `requestId` 重放后 Usage 不变；
+- 不同 payload 的 409 冲突后 Usage 不变；
+- 深度回复后日/月 Usage 再各增加 1。
+
+脚本不打印 Token、回应正文或 Secret。
 
 Android Token 跨进程持久化不能由这个脚本替代，必须按真机模板验证。
 
@@ -209,12 +218,13 @@ Set-Location .\moling-android
 |---|---|
 | Python runtime | 3.12.13（仓库既有 `.venv-m0b`） |
 | `pip check` | PASS，`No broken requirements found` |
-| `pytest -q` | PASS，68 tests；1 条依赖弃用 warning |
+| `pytest -q` | PASS，103 tests；1 条依赖弃用 warning |
 | 独立 SQLite `alembic upgrade head` | PASS，升级到 `20260726_0002` |
 | 独立 SQLite `alembic check` | PASS，`No new upgrade operations detected` |
 | Secret scan | PASS |
-| deployment preflight（CI placeholder） | PASS；未联网且未打印值 |
-| Android Release preflight | unsigned 正向 PASS；partial signing、signed `.invalid` 负向 PASS |
+| deployment preflight（运行时随机临时 Secret） | PASS；只验证结构/强度，未联网且未打印值 |
+| 三个 preflight/smoke 脚本负向矩阵 | PASS；placeholder/短 Secret/模糊布尔值、签名/URL、DeepSeek 响应契约/Usage/幂等计数均有可重复测试 |
+| Android Release preflight | unsigned 正向 PASS；partial signing、signed 无显式 URL、signed `.invalid` 和不安全 URL 负向 PASS |
 | Gradle signing/URL 负向守卫 | all-or-none、显式 URL、`.invalid` 拒绝均 PASS |
 | Android 完整命令 | PASS，113 tasks，`BUILD SUCCESSFUL` |
 | Release merged manifest | `usesCleartextTraffic=false` |

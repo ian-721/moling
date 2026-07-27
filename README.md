@@ -113,7 +113,9 @@ python scripts/secret_scan.py
 CI 执行迁移 smoke、后端测试、生产配置负向测试、Secret scan、Android Room/身份/恢复单测、lint、Debug/Release APK 与 Release AAB 构建。CI 不需要真实 DeepSeek、PostgreSQL、签名或云平台凭据。
 
 M0-B.3A 进一步使用 CI PostgreSQL 17 服务执行全新数据库 migration smoke，
-并在不复制 `.env` 的情况下构建 Docker image。真实部署前可执行：
+在运行时生成并 mask 临时 preflight Secret，并在不复制 `.env` 的情况下
+构建 Docker image。生产 salt/pepper 必须各至少 32 UTF-8 bytes，且已知
+placeholder 会被拒绝。真实部署前可执行：
 
 ```powershell
 python scripts/deployment_preflight.py
