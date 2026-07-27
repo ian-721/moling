@@ -66,6 +66,19 @@
 - Android 测试设备型号、系统版本、可用连接方式和授权测试窗口；
 - 华为无 GMS 设备、GMS 状态、网络条件和 ML Kit 模型下载条件。
 
+### 3.1 Railway PostgreSQL 服务引用
+
+Railway 部署时，应用服务应直接引用 PostgreSQL 服务提供的标准
+`DATABASE_URL`，其 scheme 通常为 `postgresql://`。后端会在内部仅替换这个
+精确的开头为 `postgresql+psycopg://`，从而让 SQLAlchemy 与 Alembic 明确
+使用仓库已安装的 psycopg 3。已经显式使用 `postgresql+psycopg://` 的 URL
+以及 SQLite 开发/测试 URL 均保持不变。
+
+该边界不会解析或重新序列化用户名、密码、百分号编码、host、port、
+database、query 或 fragment。不得人工复制、拆分、解码、编码或重组数据库
+密码；完整 `DATABASE_URL` 只能存在于部署平台的 Secret/服务引用中，不得
+进入 Git、PR、聊天或普通日志。
+
 ## 4. 可执行验收协议
 
 ### 4.1 部署前

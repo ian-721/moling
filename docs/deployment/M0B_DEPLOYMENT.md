@@ -22,7 +22,9 @@ Inject these through the deployment platform's secret/config manager:
   bytes)
 - `TOKEN_HASH_PEPPER` (independent high-entropy secret, at least 32 UTF-8
   bytes; changing it invalidates all access tokens)
-- `DATABASE_URL=postgresql+psycopg://...` (secret)
+- `DATABASE_URL` (secret): on Railway, reference the PostgreSQL service's
+  standard `DATABASE_URL` directly; do not copy its value into source or
+  rebuild it from separate credential fields
 - every authentication, registration, rate, quota, lease, and budget variable
   listed in `backend/.env.example`
 - `VISION_FALLBACK_ENABLED=false`
@@ -31,6 +33,18 @@ Inject these through the deployment platform's secret/config manager:
 Production startup deliberately fails when these controls are implicit, when
 PostgreSQL or DeepSeek is not selected, or when Vision/image persistence is
 enabled.
+
+The backend binds an exact leading `postgresql://` scheme to
+`postgresql+psycopg://` internally so SQLAlchemy and Alembic use the installed
+psycopg 3 driver. It does not parse or reserialize the username, password,
+percent-encoding, host, port, database, query, or fragment. An already explicit
+`postgresql+psycopg://` URL remains unchanged, as do SQLite development and
+test URLs.
+
+Never manually copy, split, decode, encode, or reassemble the database
+password. The complete `DATABASE_URL` must remain in the deployment platform's
+Secret/reference mechanism and must not be committed to Git, pasted into a PR
+or chat, or written to ordinary application or deployment logs.
 
 ## Deployment verification
 
