@@ -15,7 +15,7 @@ class BackendConfigTest {
 
     @Test
     fun releaseUrlRequiresHttps() {
-        BackendConfig.requireSecureReleaseUrl("https://api.moling.app")
+        BackendConfig.requireSecureReleaseUrl("https://release.invalid")
         assertThrows(IllegalArgumentException::class.java) {
             BackendConfig.requireSecureReleaseUrl("http://example.com")
         }
@@ -28,7 +28,7 @@ class BackendConfigTest {
 
     @Test
     fun networkErrorsMapToSafeMessages() {
-        val client = NotebookApiClient("https://api.moling.app")
+        val client = NotebookApiClient("https://release.invalid")
         assertEquals(
             "\u56de\u5e94\u592a\u9891\u7e41\uff0c\u8bf7\u7a0d\u540e\u518d\u8bd5",
             client.parseFailure(429, "").reason
@@ -41,7 +41,7 @@ class BackendConfigTest {
 
     @Test
     fun onlyTransient409IsRetryable() {
-        val client = NotebookApiClient("https://api.moling.app")
+        val client = NotebookApiClient("https://release.invalid")
         fun failure(code: String) = client.parseFailure(
             409,
             """{"detail":{"code":"$code","message":"conflict"}}"""

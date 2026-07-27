@@ -11,6 +11,20 @@ permissions:
 jobs:
   backend:
     runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_USER: moling
+          POSTGRES_PASSWORD: ci-only-password
+          POSTGRES_DB: moling_ci
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U moling -d moling_ci"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -25,15 +39,43 @@ jobs:
       - name: Run migration smoke
         working-directory: backend
         env:
-          DATABASE_URL: sqlite:///./migration-smoke.db
+          DATABASE_URL: postgresql+psycopg://moling:ci-only-password@localhost:5432/moling_ci
         run: |
           python -m alembic upgrade head
           python -m alembic check
       - name: Run backend tests
         working-directory: backend
         run: python -m pytest -q
+      - name: Run production configuration preflight with CI placeholders
+        env:
+          MOLING_ENV: production
+          MODEL_PROVIDER: deepseek
+          DATABASE_URL: postgresql+psycopg://moling:ci-only-password@localhost:5432/moling_ci
+          DEEPSEEK_API_KEY: ci-placeholder-not-a-secret
+          PROVIDER_USER_ID_SALT: ci-provider-salt-not-a-secret
+          TOKEN_HASH_PEPPER: ci-token-pepper-not-a-secret
+          ACCESS_TOKEN_TTL_SECONDS: "2592000"
+          REGISTRATION_ENABLED: "true"
+          REGISTRATION_REQUESTS_PER_MINUTE: "30"
+          REGISTRATION_MAX_PRINCIPALS: "10000"
+          PRINCIPAL_REQUESTS_PER_MINUTE: "10"
+          PRINCIPAL_DAILY_REQUEST_LIMIT: "50"
+          PRINCIPAL_MONTHLY_REQUEST_LIMIT: "500"
+          GLOBAL_MONTHLY_BUDGET_CNY: "300"
+          REQUEST_LEASE_SECONDS: "90"
+          REQUEST_MAX_ATTEMPTS: "3"
+          REQUEST_COST_RESERVATION_CNY: "0.05"
+          VISION_FALLBACK_ENABLED: "false"
+          DEBUG_IMAGE_SAVE_ENABLED: "false"
+        run: python scripts/deployment_preflight.py
+      - name: Verify unsigned Android Release source guards
+        run: >-
+          python scripts/android_release_preflight.py
+          --backend-url https://release.invalid
       - name: Scan tracked source for secrets
         run: python scripts/secret_scan.py
+      - name: Build backend image without an env file
+        run: docker build --tag moling-backend-ci ./backend
 
   android:
     runs-on: ubuntu-latest

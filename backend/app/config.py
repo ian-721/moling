@@ -9,10 +9,16 @@ class ConfigurationError(RuntimeError):
     """Raised when deployment configuration is unsafe or incomplete."""
 
 
-def _as_bool(value: str | None, default: bool = False) -> bool:
+def _as_bool(name: str, default: bool = False) -> bool:
+    value = os.getenv(name)
     if value is None:
         return default
-    return value.strip().lower() in {"1", "true", "yes", "on"}
+    normalized = value.strip().lower()
+    if normalized in {"1", "true", "yes", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "off"}:
+        return False
+    raise ConfigurationError(f"{name} must be true or false")
 
 
 def _as_int(name: str, default: int) -> int:
@@ -97,21 +103,15 @@ class Settings:
             provider_user_id_salt=os.getenv(
                 "PROVIDER_USER_ID_SALT", "development-only-salt"
             ),
-            vision_fallback_enabled=_as_bool(
-                os.getenv("VISION_FALLBACK_ENABLED"), False
-            ),
-            debug_image_save_enabled=_as_bool(
-                os.getenv("DEBUG_IMAGE_SAVE_ENABLED"), False
-            ),
+            vision_fallback_enabled=_as_bool("VISION_FALLBACK_ENABLED", False),
+            debug_image_save_enabled=_as_bool("DEBUG_IMAGE_SAVE_ENABLED", False),
             log_level=os.getenv("LOG_LEVEL", "INFO"),
             database_url=os.getenv("DATABASE_URL", "sqlite:///./moling.db"),
             token_hash_pepper=os.getenv(
                 "TOKEN_HASH_PEPPER", "development-only-token-pepper"
             ),
             access_token_ttl_seconds=_as_int("ACCESS_TOKEN_TTL_SECONDS", 2_592_000),
-            registration_enabled=_as_bool(
-                os.getenv("REGISTRATION_ENABLED"), True
-            ),
+            registration_enabled=_as_bool("REGISTRATION_ENABLED", True),
             registration_requests_per_minute=_as_int(
                 "REGISTRATION_REQUESTS_PER_MINUTE", 30
             ),
@@ -191,13 +191,14 @@ class Settings:
                 raise ConfigurationError(
                     "Production requires MODEL_PROVIDER=deepseek"
                 )
-            if not self.deepseek_api_key:
+            if not self.deepseek_api_key or not self.deepseek_api_key.strip():
                 raise ConfigurationError(
                     "Production requires DEEPSEEK_API_KEY from deployment secrets"
                 )
             if (
                 not self.provider_user_id_salt
-                or self.provider_user_id_salt == "development-only-salt"
+                or not self.provider_user_id_salt.strip()
+                or self.provider_user_id_salt.strip() == "development-only-salt"
             ):
                 raise ConfigurationError(
                     "Production requires a secret PROVIDER_USER_ID_SALT"
@@ -208,7 +209,9 @@ class Settings:
                 )
             if (
                 not self.token_hash_pepper
-                or self.token_hash_pepper == "development-only-token-pepper"
+                or not self.token_hash_pepper.strip()
+                or self.token_hash_pepper.strip()
+                == "development-only-token-pepper"
             ):
                 raise ConfigurationError(
                     "Production requires TOKEN_HASH_PEPPER from deployment secrets"

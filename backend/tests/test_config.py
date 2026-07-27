@@ -63,3 +63,37 @@ def test_production_requires_postgresql() -> None:
             token_hash_pepper="deployment-token-pepper-placeholder",
             database_url="sqlite:///unsafe-production.db",
         ).validate()
+
+
+@pytest.mark.parametrize(
+    ("name", "value"),
+    [
+        ("REGISTRATION_ENABLED", "sometimes"),
+        ("VISION_FALLBACK_ENABLED", "disabled"),
+        ("DEBUG_IMAGE_SAVE_ENABLED", ""),
+    ],
+)
+def test_environment_rejects_ambiguous_boolean_values(
+    monkeypatch, name: str, value: str
+) -> None:
+    monkeypatch.setenv(name, value)
+    with pytest.raises(ConfigurationError, match=f"{name} must be true or false"):
+        Settings.from_env()
+
+
+@pytest.mark.parametrize(
+    "field",
+    ["deepseek_api_key", "provider_user_id_salt", "token_hash_pepper"],
+)
+def test_production_rejects_whitespace_only_secrets(field: str) -> None:
+    values = {
+        "environment": "production",
+        "model_provider": "deepseek",
+        "deepseek_api_key": "deployment-key-placeholder",
+        "provider_user_id_salt": "deployment-salt-placeholder",
+        "token_hash_pepper": "deployment-pepper-placeholder",
+        "database_url": "postgresql+psycopg://example.invalid/moling",
+    }
+    values[field] = "   "
+    with pytest.raises(ConfigurationError):
+        Settings(**values).validate()

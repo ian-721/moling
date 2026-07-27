@@ -9,6 +9,7 @@ ROOT = Path(__file__).resolve().parents[1]
 BLOCKED_PATHS = (
     re.compile(r"(^|/)\.env($|\.)", re.IGNORECASE),
     re.compile(r"\.(jks|keystore|p12|pem|key)$", re.IGNORECASE),
+    re.compile(r"\.(apk|aab|db|sqlite|sqlite3|log)$", re.IGNORECASE),
     re.compile(r"(^|/)(private_seed|private_memory)(/|$)", re.IGNORECASE),
 )
 ALLOW_PATHS = {"backend/.env.example"}

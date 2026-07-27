@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import hmac
 import json
 import logging
 import threading
@@ -982,7 +984,15 @@ def test_log_does_not_contain_token_body_context_or_reply(
             )
         assert response.status_code == 200
         logs = caplog.text
+        token_hash = hmac.new(
+            test_settings.token_hash_pepper.encode("utf-8"),
+            token.encode("utf-8"),
+            hashlib.sha256,
+        ).hexdigest()
         assert token not in logs
+        assert f"Bearer {token}" not in logs
+        assert "Authorization" not in logs
+        assert token_hash not in logs
         assert secret_text not in logs
         assert secret_context not in logs
         assert "先把问题缩小" not in logs
