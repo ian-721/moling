@@ -58,6 +58,22 @@ def test_production_requires_postgresql() -> None:
         ).validate()
 
 
+def test_database_url_validation_error_does_not_echo_credentials() -> None:
+    password = "synthetic-password-that-must-not-be-printed"
+    database_url = (
+        f"mysql://railway:{password}@db.example.invalid:3306/moling"
+    )
+    with pytest.raises(ConfigurationError) as caught:
+        production_settings(database_url=database_url).validate()
+
+    message = str(caught.value)
+    if password in message or database_url in message:
+        pytest.fail(
+            "database credentials were included in a configuration error",
+            pytrace=False,
+        )
+
+
 @pytest.mark.parametrize(
     ("name", "value"),
     [

@@ -18,7 +18,7 @@ def production_environment(monkeypatch) -> None:
     values = {
         "MOLING_ENV": "production",
         "MODEL_PROVIDER": "deepseek",
-        "DATABASE_URL": "postgresql+psycopg://moling@example.invalid/moling",
+        "DATABASE_URL": "postgresql://moling@example.invalid/moling",
         "DEEPSEEK_API_KEY": "K" * 40,
         "PROVIDER_USER_ID_SALT": "S" * 32,
         "TOKEN_HASH_PEPPER": "P" * 32,

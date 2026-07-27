@@ -5,21 +5,22 @@ from sqlalchemy import text
 from sqlalchemy.orm import Session, sessionmaker
 from sqlalchemy.pool import StaticPool
 
-from app.config import Settings
+from app.config import Settings, normalize_database_url
 
 
 def create_database_engine(settings: Settings) -> Engine:
+    database_url = normalize_database_url(settings.database_url)
     connect_args: dict[str, object] = {}
-    if settings.database_url.startswith("sqlite"):
+    if database_url.startswith("sqlite"):
         connect_args["check_same_thread"] = False
     engine_options: dict[str, object] = {
         "connect_args": connect_args,
         "pool_pre_ping": True,
     }
-    if settings.database_url in {"sqlite://", "sqlite:///:memory:"}:
+    if database_url in {"sqlite://", "sqlite:///:memory:"}:
         engine_options["poolclass"] = StaticPool
-    engine = create_engine(settings.database_url, **engine_options)
-    if settings.database_url.startswith("sqlite"):
+    engine = create_engine(database_url, **engine_options)
+    if database_url.startswith("sqlite"):
 
         @event.listens_for(engine, "connect")
         def _enable_sqlite_foreign_keys(dbapi_connection, _) -> None:

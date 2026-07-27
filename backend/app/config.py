@@ -17,6 +17,15 @@ SECRET_PLACEHOLDER_MARKERS = (
     "change-me",
     "changeme",
 )
+POSTGRESQL_SCHEME = "postgresql://"
+PSYCOPG_SCHEME = "postgresql+psycopg://"
+
+
+def normalize_database_url(value: str) -> str:
+    """Bind a standard PostgreSQL URL to the installed psycopg 3 driver."""
+    if value.startswith(POSTGRESQL_SCHEME):
+        return PSYCOPG_SCHEME + value[len(POSTGRESQL_SCHEME) :]
+    return value
 
 
 def _validate_production_secret(
@@ -141,7 +150,9 @@ class Settings:
             vision_fallback_enabled=_as_bool("VISION_FALLBACK_ENABLED", False),
             debug_image_save_enabled=_as_bool("DEBUG_IMAGE_SAVE_ENABLED", False),
             log_level=os.getenv("LOG_LEVEL", "INFO"),
-            database_url=os.getenv("DATABASE_URL", "sqlite:///./moling.db"),
+            database_url=normalize_database_url(
+                os.getenv("DATABASE_URL", "sqlite:///./moling.db")
+            ),
             token_hash_pepper=os.getenv(
                 "TOKEN_HASH_PEPPER", "development-only-token-pepper"
             ),

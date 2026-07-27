@@ -41,7 +41,7 @@ jobs:
       - name: Run migration smoke
         working-directory: backend
         env:
-          DATABASE_URL: postgresql+psycopg://moling@localhost:5432/moling_ci
+          DATABASE_URL: postgresql://moling@localhost:5432/moling_ci
         run: |
           python -m alembic upgrade head
           python -m alembic check
@@ -67,7 +67,7 @@ jobs:
         env:
           MOLING_ENV: production
           MODEL_PROVIDER: deepseek
-          DATABASE_URL: postgresql+psycopg://moling@localhost:5432/moling_ci
+          DATABASE_URL: postgresql://moling@localhost:5432/moling_ci
           ACCESS_TOKEN_TTL_SECONDS: "2592000"
           REGISTRATION_ENABLED: "true"
           REGISTRATION_REQUESTS_PER_MINUTE: "30"
