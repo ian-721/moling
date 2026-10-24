@@ -1,47 +1,53 @@
-# 墨灵（Moling / Living Notebook）
+# Moling (墨灵) — Living Notebook
 
-墨灵是一款 Android 平板优先的 AI 手写笔记本。用户在纸面上写，客户端本地识别并先保存笔迹，服务端生成回应，回应再以墨迹浮现在纸面上。它不是聊天软件，不使用气泡、头像或消息列表。
+**An AI notebook that replies in ink, right where you write.**
 
-## v0.8 M0-B 代码基线
+[English](README.md) · [简体中文](README.zh-CN.md)
 
-当前分支在 M0-A DeepSeek V4 基线上形成远程安装闭环：
+Moling is an **Android-tablet-first, handwriting-native AI notebook**. Write directly on the page; the app saves your pen strokes locally and recognizes handwriting on the device. A backend prepares a reply, and the answer appears as ink on the same page.
 
-- 匿名安装注册为 `principal_type=device`；
-- 服务端签发至少 256-bit opaque bearer token，只保存 HMAC 摘要；
-- Android 用 Android Keystore AES-256-GCM 保存 Token，密文不参与备份；
-- Reply、Profile 和 Usage 均只信任 Bearer Token，不信任正文身份或名称；
-- `assistant_name` 按 `principal_id` 存储，同名身份互不关联；
-- SQLAlchemy 2.x + Alembic，开发/测试 SQLite，生产 PostgreSQL；
-- 每 principal 分钟限流、日/月额度及全局人民币预算事务闸门；
-- `(principal_id, request_id)` 幂等、内容指纹冲突和处理租约；
-- Room 本地保存页面、完整 stroke points、turn 和 reply outbox；
-- 失败、重试、进程重启和 stale response 均不删除原笔迹；
-- v0.8 `versionCode=800` / `versionName=0.8.0`，Debug、Release APK 和 AAB 构建管线；
-- Docker、迁移启动、健康/就绪探针、部署与回滚基线。
+This is not a chat app in notebook clothing. The interaction is built around paper, handwriting, and an animated ink response—not chat bubbles, avatars, or a message list.
 
-代码基线不等于真实生产部署、永久签名或真机通过。状态必须以本轮构建、环境凭据和 `adb devices` 的实际结果为准。
+> **Project status — v0.8 / M0-B engineering baseline.** This repository contains Android and backend implementation, tests, release-build configuration, and deployment preflight tools. It does **not** by itself establish a live production deployment, permanently signed release, app-store submission, or successful testing on a physical device.
 
-## 核心链路
+## What is implemented
 
-```text
-stroke 完成
-→ Room 立即持久化
-→ “回应”事务快照 stroke IDs + requestId
-→ ML Kit 本地识别
-→ Android Keystore Token
-→ HTTPS Bearer 鉴权
-→ principal profile / 配额 / 预算 / 幂等
-→ DeepSeek V4 或测试 Provider
-→ Room 先保存回应
-→ InkReplyOverlay 墨迹浮现
-→ 仅吸收该请求快照的 strokes
-```
+| Area | Code in this repository |
+| --- | --- |
+| **Handwriting-first Android UI** | Kotlin/Jetpack Compose canvas, ML Kit Digital Ink Recognition, and an ink-reply overlay |
+| **Local recovery** | Room stores pages, complete stroke points, notebook turns, and the reply outbox; failures and restarts are designed not to discard the original writing |
+| **Device-based access** | Anonymous device registration; 256-bit opaque bearer tokens with server-side HMAC storage and Android Keystore AES-256-GCM protection |
+| **Identity isolation** | The assistant's display name is scoped to the authenticated principal; sharing a name does not share an identity or memory |
+| **Backend** | Python/FastAPI, SQLAlchemy 2.x, Alembic, SQLite for development/tests and PostgreSQL for production configuration |
+| **Request and cost controls** | Per-principal rate limits and quotas, global CNY budget reservation, request idempotency, fingerprint conflicts, and recovery leases |
+| **Build and deployment tools** | Docker, migration/health checks, Android Debug and Release build paths, APK/AAB configuration, and release preflight scripts |
 
-## 后端本地运行
+The model provider is configurable: local development uses a fake provider, while the production configuration targets **DeepSeek V4**. The code's presence is not evidence of an operating hosted service.
 
-推荐 Python 3.12+：
+## How a reply moves through the system
 
-```powershell
+~~~text
+User finishes a pen stroke
+  → The stroke is persisted in Room
+  → "Reply" snapshots the selected stroke IDs and request ID
+  → ML Kit recognizes handwriting on-device
+  → Android attaches the device's bearer token
+  → Backend checks identity, quotas, budget, and idempotency
+  → DeepSeek V4 (or a fake test provider) generates a response
+  → The reply is stored locally before being shown
+  → InkReplyOverlay renders the response as ink
+  → Only the snapshotted strokes are absorbed
+~~~
+
+If recognition, the network, or the model fails, the original strokes remain recoverable. New strokes written while a response is appearing are not part of the earlier request snapshot.
+
+## Explore the project locally
+
+### Backend
+
+Use **Python 3.12+**. The provided development environment uses SQLite and the fake provider; **no DeepSeek API key is needed**.
+
+~~~powershell
 cd backend
 python -m venv .venv
 .\.venv\Scripts\Activate.ps1
@@ -50,90 +56,58 @@ Copy-Item .env.example .env
 python -m alembic upgrade head
 python -m pytest -q
 python -m uvicorn main:app --host 127.0.0.1 --port 8000
-```
+~~~
 
-本地 `.env.example` 使用 SQLite + fake provider，无需真实 DeepSeek Key。
+Selected routes:
 
-```text
-GET  /healthz
-GET  /readyz
-POST /api/auth/device/register
-GET  /api/profile
-PATCH /api/profile
-GET  /api/usage
-POST /api/notebook/reply
-```
+| Route | Purpose |
+| --- | --- |
+| `GET /healthz`, `GET /readyz` | Health and readiness |
+| `POST /api/auth/device/register` | Anonymous device registration |
+| `GET /api/profile`, `PATCH /api/profile` | Per-device assistant profile |
+| `GET /api/usage` | Usage |
+| `POST /api/notebook/reply` | Generate a notebook reply |
 
-除注册和健康检查外，接口要求 `Authorization: Bearer <token>`。
+Except for registration and health/readiness, these APIs require an authenticated bearer token. See the [remote-install and recovery protocol](docs/launch/M0B_REMOTE_INSTALL_PROTOCOL.md) for the exact request and state contracts.
 
-完整认证、配额、幂等与恢复协议见
-`docs/launch/M0B_REMOTE_INSTALL_PROTOCOL.md`；容器部署见
-`docs/deployment/M0B_DEPLOYMENT.md`。
+### Android
 
-## 生产配置
+Use **JDK 21** and the checked-in Gradle wrapper:
 
-生产必须：
-
-- `MOLING_ENV=production`
-- `MODEL_PROVIDER=deepseek`
-- PostgreSQL `DATABASE_URL`
-- Secret 管理注入 `DEEPSEEK_API_KEY`、`PROVIDER_USER_ID_SALT`、`TOKEN_HASH_PEPPER`
-- 显式配置 Token TTL、注册开关/保护、限流、日/月额度、租约和全局预算
-- HTTPS ingress
-- Vision 与图片落盘关闭
-
-缺少任何生产控制时启动会拒绝。真实值不得进入 Git、Android、Docker image、日志或 CI 输出。
-
-## Android 构建
-
-使用 JDK 21：
-
-```powershell
+~~~powershell
 cd moling-android
 .\gradlew.bat :app:testDebugUnitTest :app:lintDebug `
   :app:assembleDebug :app:assembleRelease :app:bundleRelease
-```
+~~~
 
-Release URL 通过 `-PMOLING_RELEASE_BACKEND_URL=https://...` 注入，且必须 HTTPS。
-unsigned CI 基线使用不可路由的 `https://release.invalid`；永久签名构建必须显式
-提供真实 hostname。签名只读取四个 `MOLING_KEYSTORE_*` 环境变量；全无时仍可
-构建 unsigned Release。完整步骤见 `docs/release/V0_8_BUILD_SIGN_INSTALL.md`。
+The baseline declares `versionCode=800` and `versionName=0.8.0`. CI can produce **unsigned** Release artifacts; a permanently signed release needs an authorized signing key and an explicit HTTPS backend URL. No real signing keys are shipped here.
 
-## 验证
+Read the [build, signing, and device-install guide](docs/release/V0_8_BUILD_SIGN_INSTALL.md) before interpreting build artifacts as an actual release or device acceptance result.
 
-```powershell
-cd backend
-python -m alembic upgrade head
-python -m alembic check
-python -m pytest -q
-cd ..
+## Verification and deployment boundaries
+
+From the repository root, the source-level secret scan can be run with:
+
+~~~powershell
 python scripts/secret_scan.py
-```
+~~~
 
-CI 执行迁移 smoke、后端测试、生产配置负向测试、Secret scan、Android Room/身份/恢复单测、lint、Debug/Release APK 与 Release AAB 构建。CI 不需要真实 DeepSeek、PostgreSQL、签名或云平台凭据。
+The GitHub Actions workflow is configured for backend tests, migration checks (including a PostgreSQL 17 service), negative production-config checks, the secret scan, a Docker build, and Android unit tests/lint/build tasks. Configured checks do not replace results from a real device or a live environment.
 
-M0-B.3A 进一步使用 CI PostgreSQL 17 服务执行全新数据库 migration smoke，
-在运行时生成并 mask 临时 preflight Secret，并在不复制 `.env` 的情况下
-构建 Docker image。生产 salt/pepper 必须各至少 32 UTF-8 bytes，且已知
-placeholder 会被拒绝。真实部署前可执行：
+Production configuration requires PostgreSQL, HTTPS, a DeepSeek API key supplied through a secret manager, signing material for signed Android artifacts, and explicit authentication/quota/budget settings. Known placeholder secrets are rejected. Do not commit production values.
 
-```powershell
-python scripts/deployment_preflight.py
-python scripts/android_release_preflight.py `
-  --backend-url 'https://<authorized-host>'
-python scripts/remote_https_smoke.py `
-  --base-url 'https://<authorized-host>'
-```
+- [Backend deployment](docs/deployment/M0B_DEPLOYMENT.md)
+- [Real-environment preflight and remaining acceptance work](docs/deployment/M0B3A_REAL_ENVIRONMENT_PREFLIGHT.md)
+- [Identity and naming boundaries](docs/launch/00_IDENTITY_AND_NAMING_BOUNDARY.md)
 
-远程 smoke 默认不创建数据或调用模型；只有显式加入 `--exercise-api` 才会创建
-一次性 principal 并调用普通/深度回复。完整差距矩阵、外部输入和回滚协议见
-`docs/deployment/M0B3A_REAL_ENVIRONMENT_PREFLIGHT.md`。
+### Not yet established by this baseline
 
-## M0-C 不在本轮
+Cloud notebook sync and cross-device memory; Google/Huawei/email login; importing a private long-term memory seed; subscriptions, payments, and store entitlements; iOS or web clients; formal store submissions and production rollout.
 
-- 云端笔记或多设备同步；
-- Google/华为/邮箱登录；
-- 长期记忆和私人 seed 导入；
-- 支付、订阅和商店权益；
-- iOS/Web；
-- 商店正式提交。
+## About the project
+
+Moling explores a simple interaction question: **What would an AI assistant feel like if the notebook—not the chat window—were the interface?** The repository documents the engineering work toward that experience, including recovery and identity boundaries, without treating a code or CI result as proof that the product has shipped.
+
+**Maintainer:** [Yanyang (Ian) Zhao](https://github.com/ian-721).
+
+**Source availability:** The repository is publicly viewable. No repository-wide open-source license is included here at present; bundled third-party assets may have their own terms.
